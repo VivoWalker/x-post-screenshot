@@ -1,0 +1,165 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: #f4f7f9;
+  color: #0f1419;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  padding: 56px 20px;
+  display: grid;
+  place-items: start center;
+}
+
+.settings-card {
+  width: min(620px, 100%);
+  padding: 30px;
+  border: 1px solid #cfd9de;
+  border-radius: 22px;
+  background: #fff;
+  box-shadow: 0 16px 48px rgba(15, 20, 25, 0.1);
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 30px;
+}
+
+.brand-icon {
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  border-radius: 15px;
+  background: #0f1419;
+  color: #fff;
+  font-size: 25px;
+  font-weight: 700;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 24px;
+}
+
+.subtitle,
+.shortcut-panel p,
+.hint {
+  color: #536471;
+}
+
+.subtitle {
+  margin-top: 4px;
+}
+
+.shortcut-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px;
+  border-radius: 16px;
+  background: #eff3f4;
+}
+
+h2 {
+  margin-bottom: 6px;
+  font-size: 17px;
+}
+
+kbd {
+  flex: 0 0 auto;
+  padding: 9px 13px;
+  border: 1px solid #aab8c2;
+  border-bottom-width: 3px;
+  border-radius: 9px;
+  background: #fff;
+  color: #0f1419;
+  font: 700 14px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+kbd.unassigned {
+  color: #b42318;
+}
+
+.status {
+  min-height: 22px;
+  margin: 12px 2px 16px;
+  color: #b42318;
+  font-size: 14px;
+}
+
+button {
+  width: 100%;
+  padding: 12px 18px;
+  border: 0;
+  border-radius: 999px;
+  background: #1d9bf0;
+  color: #fff;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 20px;
+}
+
+button:hover {
+  background: #1a8cd8;
+}
+
+button:focus-visible {
+  outline: 3px solid rgba(29, 155, 240, 0.35);
+  outline-offset: 3px;
+}
+
+.hint {
+  margin-top: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    background: #000;
+    color: #e7e9ea;
+  }
+
+  .settings-card {
+    border-color: #2f3336;
+    background: #16181c;
+  }
+
+  .brand-icon {
+    background: #e7e9ea;
+    color: #0f1419;
+  }
+
+  .subtitle,
+  .shortcut-panel p,
+  .hint {
+    color: #8b98a5;
+  }
+
+  .shortcut-panel {
+    background: #202327;
+  }
+
+  kbd {
+    border-color: #536471;
+    background: #0f1419;
+    color: #e7e9ea;
+  }
+}

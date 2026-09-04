@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "X 帖子截图",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "用快捷键选择 X/Twitter 帖子，将完整截图直接复制到剪贴板。",
   "permissions": [
     "activeTab",
@@ -38,5 +38,9 @@
   },
   "action": {
     "default_title": "选择并截图 X 帖子"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

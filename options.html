@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>X 帖子截图设置</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main class="settings-card">
+      <div class="brand-row">
+        <div class="brand-icon" aria-hidden="true">X</div>
+        <div>
+          <h1>X 帖子截图</h1>
+          <p class="subtitle">快捷键设置</p>
+        </div>
+      </div>
+
+      <section class="shortcut-panel" aria-labelledby="shortcut-title">
+        <div>
+          <h2 id="shortcut-title">开始截图</h2>
+          <p>在 X 页面按下快捷键，进入帖子选择模式。</p>
+        </div>
+        <kbd id="current-shortcut" aria-live="polite">读取中…</kbd>
+      </section>
+
+      <p id="shortcut-status" class="status" aria-live="polite"></p>
+
+      <button id="open-shortcuts" type="button">更改快捷键</button>
+      <p class="hint">Chrome 会在扩展快捷键页面中保存设置。修改后返回本页即可看到新快捷键。</p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>
