@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "X 帖子截图",
+  "version": "0.2.0",
+  "description": "用快捷键选择 X/Twitter 帖子，将完整截图直接复制到剪贴板。",
+  "permissions": [
+    "activeTab",
+    "clipboardWrite",
+    "offscreen",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "start-capture": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "选择并截图 X 帖子"
+    }
+  },
+  "action": {
+    "default_title": "选择并截图 X 帖子"
+  }
+}
