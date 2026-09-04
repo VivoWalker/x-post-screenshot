@@ -164,6 +164,9 @@
     await animationFrames(2);
     await waitForImages();
     await new Promise((resolve) => setTimeout(resolve, 120));
+    // X may recreate its blue "new posts" pill after any scroll.
+    hideTransientUi();
+    await animationFrames(1);
     return {
       ok: true,
       scrollY: window.scrollY,
@@ -199,12 +202,18 @@
   }
 
   function hideTransientUi() {
-    const newPostPattern = /(?:有新帖(?:子|文)|查看新帖(?:子|文)|show\s+(?:\d+\s+)?new posts?|see new posts?|new posts? available|新しいポスト|nuevas publicaciones|nouveaux posts)/i;
+    const newPostPattern = /(?:有新(?:的)?帖(?:子|文)|查看新帖(?:子|文)|show\s+(?:\d+\s+)?new posts?|see new posts?|new posts? available|新しいポスト|nuevas publicaciones|nouveaux posts)/i;
     const candidates = document.querySelectorAll('button, [role="button"], [data-testid="toast"]');
     for (const candidate of candidates) {
       const isToast = candidate.matches('[data-testid="toast"]');
       const text = candidate.textContent?.replace(/\s+/g, " ").trim() || "";
-      if (!isToast && !newPostPattern.test(text)) continue;
+      const accessibleText = [
+        text,
+        candidate.getAttribute("aria-label"),
+        candidate.getAttribute("title")
+      ].filter(Boolean).join(" ");
+      if (!isToast && !newPostPattern.test(accessibleText)) continue;
+      if (candidate.classList.contains("x-shot-transient-hidden")) continue;
       candidate.classList.add("x-shot-transient-hidden");
       state.hiddenTransient.push(candidate);
     }
