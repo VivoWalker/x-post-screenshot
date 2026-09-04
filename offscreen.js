@@ -12,7 +12,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleMessage(message) {
   if (message.type === "X_SHOT_BEGIN") {
-    job = { capture: message.capture, canvas: null, context: null, outputScale: null, sourceScale: null };
+    job = {
+      capture: message.capture,
+      canvas: null,
+      context: null,
+      outputScale: null,
+      sourceScale: null,
+      frameCount: 0,
+      lastDestinationBottom: 0
+    };
     return { ok: true };
   }
   if (message.type === "X_SHOT_FRAME") return addFrame(message.dataUrl, message.frame);
@@ -30,6 +38,20 @@ async function addFrame(dataUrl, frame) {
   const cropTop = frame.contentTop - frame.scrollY;
   const cropHeight = frame.contentBottom - frame.contentTop;
   const destinationY = frame.contentTop - job.capture.top;
+  const destinationBottomY = frame.contentBottom - job.capture.top;
+  let destinationTop = Math.max(0, Math.floor(destinationY * job.outputScale));
+  const destinationBottom = Math.min(
+    job.canvas.height,
+    Math.ceil(destinationBottomY * job.outputScale)
+  );
+
+  // Adjacent CSS-pixel slices can land on fractional device pixels. Drawing
+  // each slice on integer boundaries with a one-pixel overlap prevents the
+  // prefilled canvas background from showing through as a hairline seam.
+  if (job.frameCount > 0) {
+    destinationTop = Math.max(0, Math.min(destinationTop, job.lastDestinationBottom) - 1);
+  }
+  const destinationHeight = Math.max(1, destinationBottom - destinationTop);
 
   job.context.drawImage(
     image,
@@ -38,10 +60,12 @@ async function addFrame(dataUrl, frame) {
     job.capture.width * sourceScaleX,
     cropHeight * sourceScaleY,
     0,
-    destinationY * job.outputScale,
-    job.capture.width * job.outputScale,
-    cropHeight * job.outputScale
+    destinationTop,
+    job.canvas.width,
+    destinationHeight
   );
+  job.frameCount += 1;
+  job.lastDestinationBottom = destinationBottom;
   return { ok: true };
 }
 
@@ -59,8 +83,8 @@ function initializeCanvas(image, frame) {
   job.sourceScale = sourceScale;
   job.outputScale = sourceScale * limitScale;
   job.canvas = document.createElement("canvas");
-  job.canvas.width = Math.max(1, Math.floor(job.capture.width * job.outputScale));
-  job.canvas.height = Math.max(1, Math.floor(job.capture.height * job.outputScale));
+  job.canvas.width = Math.max(1, Math.ceil(job.capture.width * job.outputScale));
+  job.canvas.height = Math.max(1, Math.ceil(job.capture.height * job.outputScale));
   job.context = job.canvas.getContext("2d", { alpha: false });
   job.context.fillStyle = "#ffffff";
   job.context.fillRect(0, 0, job.canvas.width, job.canvas.height);
