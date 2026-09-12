@@ -203,6 +203,13 @@
 
   function hideTransientUi() {
     const newPostPattern = /(?:有新(?:的)?帖(?:子|文)|查看新帖(?:子|文)|show\s+(?:\d+\s+)?new posts?|see new posts?|new posts? available|新しいポスト|nuevas publicaciones|nouveaux posts)/i;
+    const immersiveTranslateOverlays = document.querySelectorAll('#immersive-translate-popup');
+    for (const overlay of immersiveTranslateOverlays) {
+      if (overlay.classList.contains("x-shot-transient-hidden")) continue;
+      overlay.classList.add("x-shot-transient-hidden");
+      state.hiddenTransient.push(overlay);
+    }
+
     const candidates = document.querySelectorAll('button, [role="button"], [data-testid="toast"]');
     for (const candidate of candidates) {
       const isToast = candidate.matches('[data-testid="toast"]');

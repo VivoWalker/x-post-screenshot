@@ -51,6 +51,7 @@ html.x-shot-capturing header[role="banner"],
 html.x-shot-capturing [data-testid="BottomBar"],
 html.x-shot-capturing [data-testid="mask"],
 html.x-shot-capturing [data-testid="toast"],
+html.x-shot-capturing #immersive-translate-popup,
 html.x-shot-capturing [role="dialog"] {
   visibility: hidden !important;
 }
