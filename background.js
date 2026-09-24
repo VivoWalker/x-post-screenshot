@@ -1,5 +1,8 @@
 const CAPTURE_MESSAGE = "X_SHOT_CAPTURE";
+const MIN_CAPTURE_INTERVAL_MS = 650;
+const QUOTA_RETRY_DELAY_MS = 1100;
 let captureInProgress = false;
+let lastCaptureCallAt = -Infinity;
 
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== "start-capture") return;
@@ -82,7 +85,7 @@ async function captureSelection(tabId, windowId, selection) {
       const visibleBottom = Math.min(targetBottom, position.scrollY + position.viewportHeight);
       if (visibleBottom <= nextY + 0.5) throw new Error("无法继续截取页面底部内容");
 
-      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+      const dataUrl = await captureVisibleFrame(windowId);
       const added = await chrome.runtime.sendMessage({
         target: "offscreen",
         type: "X_SHOT_FRAME",
@@ -124,6 +127,23 @@ async function captureSelection(tabId, windowId, selection) {
   } finally {
     await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_RESTORE" }).catch(() => {});
     captureInProgress = false;
+  }
+}
+
+async function captureVisibleFrame(windowId) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const waitMs = Math.max(0, lastCaptureCallAt + MIN_CAPTURE_INTERVAL_MS - Date.now());
+    if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    lastCaptureCallAt = Date.now();
+
+    try {
+      return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+    } catch (error) {
+      if (!/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(error?.message || "") || attempt === 2) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, QUOTA_RETRY_DELAY_MS));
+    }
   }
 }
 
