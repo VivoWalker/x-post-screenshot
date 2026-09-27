@@ -1,3 +1,12 @@
+function xShotFooterTop(article, mediaBottom, scrollY, captureTop) {
+  const actionTops = Array.from(article?.querySelectorAll('[data-testid="reply"]') || [])
+    .map((button) => button.closest('[role="group"]'))
+    .filter(Boolean)
+    .map((group) => group.getBoundingClientRect().top + scrollY - captureTop)
+    .filter((top) => Number.isFinite(top) && top >= mediaBottom);
+  return actionTops.length ? Math.max(...actionTops) : mediaBottom;
+}
+
 (() => {
   if (globalThis.__xShotLoaded) return;
   globalThis.__xShotLoaded = true;
@@ -288,8 +297,6 @@
     const contentRight = Math.min(capture.left - scrollX + capture.width, Math.max(rect.right, textRect?.right ?? rect.right));
     const videoTop = rect.top + scrollY - capture.top;
     const mediaTop = Math.min(videoTop, ...photoRects.map((photo) => photo.top));
-    const actionGroup = selected?.querySelector('[data-testid="reply"]')?.closest('[role="group"]');
-    const actionTop = actionGroup?.getBoundingClientRect().top + scrollY - capture.top;
     const mediaBottom = Math.max(videoTop + rect.height, ...photoRects.map((photo) => photo.top + photo.height));
     return {
       ok: true,
@@ -299,7 +306,7 @@
       photoRects,
       contentArea: { left: contentLeft + scrollX - capture.left, width: contentRight - contentLeft },
       mediaTop,
-      footerTop: Number.isFinite(actionTop) && actionTop >= mediaBottom ? actionTop : mediaBottom,
+      footerTop: xShotFooterTop(selected, mediaBottom, scrollY, capture.top),
       backgroundColor: getComputedStyle(document.body).backgroundColor || "#000"
     };
   }

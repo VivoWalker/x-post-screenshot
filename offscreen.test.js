@@ -116,3 +116,122 @@ test('recorded frame draws text, moving video, thumbnails, then interactions', (
   assert.deepEqual(draws.slice(2, 4).map(({ y }) => y), [500, 500]);
   assert.equal(draws[4].y, 632);
 });
+
+test('composition keeps half-resolution screenshot pixels instead of dropping to CSS pixels', () => {
+  const context = loadOffscreen();
+  const composition = context.createVideoComposition(
+    { width: 600, height: 1000 },
+    { mediaTop: 200, footerTop: 800, videoRect: { width: 500, height: 250 }, photoRects: [] },
+    { width: 1440, height: 2560 },
+    1200
+  );
+  assert.equal(composition.width, 1200);
+  assert.equal(composition.video.width, 1200);
+  assert.equal(composition.height, 1400);
+});
+
+test('video still is halved from stitched screenshot with safe side caps', async () => {
+  const context = loadOffscreen();
+  const canvas = { width: 2400, height: 3600, toDataURL() { return 'data:image/png;base64,AAAA'; } };
+  let reduced;
+  context.document = {
+    createElement() {
+      reduced = { width: 0, height: 0, getContext() { return { drawImage() {} }; }, toDataURL() { return 'data:image/png;base64,BBBB'; } };
+      return reduced;
+    }
+  };
+  context.fixture = { canvas, outputScale: 1, sourceScale: 1 };
+  vm.runInContext('job = fixture', context);
+  const result = await context.finish(true);
+  assert.equal(result.width, 1200);
+  assert.equal(result.height, 1800);
+});
+
+function createRecordingHarness() {
+  const context = loadOffscreen();
+  const audioTrack = { stop() {} };
+  const tabVideoTrack = { stop() {} };
+  const canvasVideoTrack = { stop() {} };
+  let recorder;
+  class FakeRecorder {
+    static isTypeSupported() { return true; }
+    constructor(_stream, options) { this.options = options; this.state = 'inactive'; this.stopCalls = 0; this.listeners = {}; recorder = this; }
+    addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+    removeEventListener(type, listener) { this.listeners[type] = (this.listeners[type] || []).filter((item) => item !== listener); }
+    dispatch(type, event = {}) { for (const listener of this.listeners[type] || []) listener(event); }
+    start() { this.state = 'recording'; }
+    stop() { this.state = 'inactive'; this.stopCalls += 1; }
+  }
+  context.MediaRecorder = FakeRecorder;
+  context.MediaStream = class { constructor(tracks) { this.tracks = tracks; } };
+  context.navigator = { mediaDevices: { async getUserMedia() {
+    return { getAudioTracks: () => [audioTrack], getTracks: () => [audioTrack, tabVideoTrack] };
+  } } };
+  context.document = { createElement(type) {
+    if (type === 'video') return { readyState: 0, async play() {} };
+    return {
+      width: 0,
+      height: 0,
+      getContext() { return { fillRect() {}, drawImage() {} }; },
+      captureStream() { return { getVideoTracks: () => [canvasVideoTrack], getTracks: () => [canvasVideoTrack] }; }
+    };
+  } };
+  context.setInterval = () => 1;
+  context.clearInterval = () => {};
+  context.fixtureImage = { naturalWidth: 1200, naturalHeight: 2000 };
+  vm.runInContext('loadImage = async () => fixtureImage', context);
+  const layout = {
+    mediaTop: 200,
+    footerTop: 800,
+    viewport: { width: 800, height: 600 },
+    videoRect: { left: 100, top: 100, width: 500, height: 250 },
+    documentVideoRect: { left: 0, top: 200, width: 500, height: 250 },
+    photoRects: []
+  };
+  return {
+    context,
+    start: () => context.beginRecording({ streamId: 'test-stream', still: 'data:image/png;base64,AAAA', capture: { width: 600, height: 1000 }, layout }),
+    recorder: () => recorder
+  };
+}
+
+test('recorder requests about 8000 kbps for the MP4 video track', async () => {
+  const harness = createRecordingHarness();
+  await harness.start();
+  assert.equal(harness.recorder().options.videoBitsPerSecond, 8_000_000);
+  harness.context.abortRecording();
+});
+
+test('recording continues below 40 MB and stops after crossing that cap', async () => {
+  const harness = createRecordingHarness();
+  await harness.start();
+  const recorder = harness.recorder();
+  recorder.ondataavailable({ data: { size: 35_000_000 } });
+  assert.equal(recorder.stopCalls, 0);
+  recorder.ondataavailable({ data: { size: 6_000_000 } });
+  assert.equal(recorder.stopCalls, 1);
+  harness.context.abortRecording();
+});
+
+test('size-limited MP4 waits for the final data chunk after recorder becomes inactive', async () => {
+  const harness = createRecordingHarness();
+  harness.context.Blob = class {
+    constructor(chunks) { this.size = chunks.reduce((sum, chunk) => sum + chunk.size, 0); }
+  };
+  harness.context.FileReader = class {
+    readAsDataURL() { this.result = 'data:video/mp4;base64,AAAA'; this.onload(); }
+  };
+  await harness.start();
+  const recorder = harness.recorder();
+  recorder.stop = () => {
+    recorder.state = 'inactive';
+    recorder.stopCalls += 1;
+    queueMicrotask(() => {
+      recorder.ondataavailable({ data: { size: 1_000_000 } });
+      recorder.dispatch('stop');
+    });
+  };
+  recorder.ondataavailable({ data: { size: 41_000_000 } });
+  const result = await harness.context.finishRecording();
+  assert.equal(result.bytes, 42_000_000);
+});

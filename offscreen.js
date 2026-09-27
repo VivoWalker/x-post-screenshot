@@ -2,7 +2,7 @@ const MAX_SIDE = 16000;
 const MAX_PIXELS = 100_000_000;
 let job = null;
 let recording = null;
-const VIDEO_LIMITS = { width: 720, height: 1280, fps: 24, videoBitsPerSecond: 1_200_000, audioBitsPerSecond: 96_000, maxBytes: 18_000_000 };
+const VIDEO_LIMITS = { width: 1440, height: 2560, fps: 24, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 96_000, maxBytes: 40_000_000 };
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.target !== "offscreen") return;
@@ -101,7 +101,7 @@ async function finish(forVideo = false) {
   if (!job?.canvas) throw new Error("没有可复制的截图内容");
   let output = job.canvas;
   if (forVideo) {
-    const ratio = Math.min(1, VIDEO_LIMITS.width / output.width, VIDEO_LIMITS.height / output.height);
+    const ratio = Math.min(0.5, VIDEO_LIMITS.width / output.width, VIDEO_LIMITS.height / output.height);
     const reduced = document.createElement("canvas");
     reduced.width = Math.max(2, Math.floor(output.width * ratio / 2) * 2);
     reduced.height = Math.max(2, Math.floor(output.height * ratio / 2) * 2);
@@ -139,7 +139,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
   ].find((type) => MediaRecorder.isTypeSupported(type));
   if (!mimeType) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
   const base = await loadImage(still);
-  const composition = createVideoComposition(capture, layout, VIDEO_LIMITS);
+  const composition = createVideoComposition(capture, layout, VIDEO_LIMITS, base.naturalWidth);
   const canvas = document.createElement("canvas");
   canvas.width = composition.width;
   canvas.height = composition.height;
@@ -161,7 +161,11 @@ async function beginRecording({ streamId, still, capture, layout }) {
       videoBitsPerSecond: VIDEO_LIMITS.videoBitsPerSecond,
       audioBitsPerSecond: VIDEO_LIMITS.audioBitsPerSecond
     });
-    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, tooLarge: false, error: null, drawTimer: null };
+    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
+    current.stopPromise = new Promise((resolve) => {
+      recorder.addEventListener("stop", resolve, { once: true });
+      recorder.addEventListener("error", resolve, { once: true });
+    });
     recorder.ondataavailable = (event) => {
       if (event.data?.size) chunks.push(event.data);
       if (chunks.reduce((sum, chunk) => sum + chunk.size, 0) > VIDEO_LIMITS.maxBytes) {
@@ -182,7 +186,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
   }
 }
 
-function createVideoComposition(capture, layout, limits) {
+function createVideoComposition(capture, layout, limits, sourceWidth = capture.width) {
   const mediaTop = Math.max(0, Math.min(capture.height, layout.mediaTop ?? layout.documentVideoRect.top));
   const footerTop = Math.max(mediaTop, Math.min(capture.height, layout.footerTop ?? capture.height));
   const contentLeft = Math.max(0, Math.min(capture.width, layout.contentArea?.left ?? 0));
@@ -192,7 +196,7 @@ function createVideoComposition(capture, layout, limits) {
   const rowCount = Math.ceil(layout.photoRects.length / 2);
   const photoHeight = rowCount ? rowCount * rowHeight + (rowCount - 1) * 4 : 0;
   const totalHeight = mediaTop + videoHeight + photoHeight + capture.height - footerTop;
-  const scale = Math.min(1, limits.width / capture.width, limits.height / totalHeight);
+  const scale = Math.min(sourceWidth / capture.width, limits.width / capture.width, limits.height / totalHeight);
   const width = Math.max(2, Math.floor(capture.width * scale / 2) * 2);
   const actualScale = width / capture.width;
   const height = Math.max(2, Math.floor(totalHeight * actualScale / 2) * 2);
@@ -270,13 +274,8 @@ async function finishRecording() {
   const current = recording;
   if (!current) throw new Error("视频录制任务不存在");
   try {
-    if (current.recorder.state !== "inactive") {
-      await new Promise((resolve, reject) => {
-        current.recorder.addEventListener("stop", resolve, { once: true });
-        current.recorder.addEventListener("error", (event) => reject(event.error || new Error("MP4 编码失败")), { once: true });
-        current.recorder.stop();
-      });
-    }
+    if (current.recorder.state !== "inactive") current.recorder.stop();
+    await current.stopPromise;
     if (current.error) throw current.error;
     const blob = new Blob(current.chunks, { type: "video/mp4" });
     if (!blob.size) throw new Error("录制结果为空");

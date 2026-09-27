@@ -114,7 +114,7 @@ async function captureSelection(tabId, windowId, selection) {
     if (!result?.ok || !result.dataUrl) throw new Error(result?.error || "无法生成最终图片");
 
     if (prepared.hasVideo) {
-      await notify(tabId, "progress", "正在准备低画质 MP4 录制…");
+      await notify(tabId, "progress", "正在准备 MP4 录制…");
       const layout = await chrome.tabs.sendMessage(tabId, {
         type: "X_SHOT_VIDEO_POSITION",
         capture
