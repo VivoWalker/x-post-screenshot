@@ -9,6 +9,7 @@
     hovered: null,
     selectedArticles: [],
     expandedMedia: [],
+    originalMediaScrolls: [],
     hiddenTransient: [],
     videos: [],
     recordingVideo: null,
@@ -158,6 +159,13 @@
       video.muted = true;
     }
     if (state.recordingVideo) {
+      let ancestor = state.recordingVideo.parentElement;
+      while (ancestor && ancestor !== targets.at(-1)) {
+        if (ancestor.scrollWidth > ancestor.clientWidth + 4) {
+          state.originalMediaScrolls.push({ element: ancestor, left: ancestor.scrollLeft });
+        }
+        ancestor = ancestor.parentElement;
+      }
       try { await seekToStart(state.recordingVideo); } catch { /* a live source may not seek */ }
       state.recordingVideo.scrollIntoView({ block: "center", behavior: "instant" });
     }
@@ -242,10 +250,12 @@
       scroller.scrollLeft = scrollLeft;
       gallery.remove();
     });
+    state.originalMediaScrolls.forEach(({ element, left }) => { element.scrollLeft = left; });
     state.hiddenTransient.forEach((element) => element.classList.remove("x-shot-transient-hidden"));
     window.scrollTo({ top: state.originalScrollY, behavior: "instant" });
     state.selectedArticles = [];
     state.expandedMedia = [];
+    state.originalMediaScrolls = [];
     state.hiddenTransient = [];
     state.videos = [];
     state.recordingVideo = null;
