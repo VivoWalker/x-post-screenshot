@@ -10,6 +10,9 @@
     selectedArticles: [],
     expandedMedia: [],
     hiddenTransient: [],
+    videos: [],
+    recordingVideo: null,
+    unmuteTimer: null,
     originalScrollY: 0,
     toastTimer: null
   };
@@ -31,6 +34,23 @@
     if (message?.type === "X_SHOT_COPY") {
       copyImageToClipboard(message.dataUrl).then(sendResponse);
       return true;
+    }
+    if (message?.type === "X_SHOT_VIDEO_POSITION") {
+      positionVideo(message.capture).then(sendResponse);
+      return true;
+    }
+    if (message?.type === "X_SHOT_VIDEO_PLAY") {
+      playVideo().then(sendResponse);
+      return true;
+    }
+    if (message?.type === "X_SHOT_VIDEO_WAIT") {
+      waitForVideoEnd(message.maxDurationMs).then(sendResponse);
+      return true;
+    }
+    if (message?.type === "X_SHOT_VIDEO_STOP") {
+      state.recordingVideo?.pause();
+      sendResponse({ ok: true });
+      return;
     }
     if (message?.type === "X_SHOT_RESTORE") {
       restorePage();
@@ -88,7 +108,7 @@
 
     const selection = describeSelection(state.hovered);
     exitSelection();
-    showToast("正在准备完整截图…", "progress");
+    showToast("正在准备帖子内容…", "progress");
     chrome.runtime.sendMessage({ type: "X_SHOT_SELECTION", selection })
       .then((result) => {
         if (!result?.ok) showToast(`截图失败：${result?.error || "后台没有返回结果"}`, "error");
@@ -130,10 +150,29 @@
 
     state.originalScrollY = window.scrollY;
     state.selectedArticles = targets;
+    state.recordingVideo = targets.at(-1)?.querySelector("video") || null;
+    state.videos = Array.from(new Set(targets.flatMap((article) => Array.from(article.querySelectorAll("video")))))
+      .map((video) => ({ video, muted: video.muted, volume: video.volume, time: video.currentTime, paused: video.paused }));
+    for (const { video } of state.videos) {
+      video.pause();
+      video.muted = true;
+    }
+    if (state.recordingVideo) {
+      try { await seekToStart(state.recordingVideo); } catch { /* a live source may not seek */ }
+      state.recordingVideo.scrollIntoView({ block: "center", behavior: "instant" });
+    }
     targets.forEach((article) => article.classList.add("x-shot-target"));
     document.documentElement.classList.add("x-shot-capturing");
     hideTransientUi();
     await expandScrollableMedia(targets);
+    const refreshedVideo = targets.at(-1)?.querySelector("video") || null;
+    if (refreshedVideo && refreshedVideo !== state.recordingVideo) {
+      state.recordingVideo = refreshedVideo;
+      state.videos.push({ video: refreshedVideo, muted: refreshedVideo.muted, volume: refreshedVideo.volume, time: refreshedVideo.currentTime, paused: refreshedVideo.paused });
+      refreshedVideo.pause();
+      refreshedVideo.muted = true;
+    }
+    if (!refreshedVideo) state.recordingVideo = null;
     await waitForImages();
     await animationFrames(2);
 
@@ -147,6 +186,7 @@
 
     return {
       ok: true,
+      hasVideo: Boolean(state.recordingVideo),
       capture: {
         left,
         top,
@@ -187,6 +227,14 @@
   }
 
   function restorePage() {
+    clearInterval(state.unmuteTimer);
+    state.unmuteTimer = null;
+    for (const { video, muted, volume, time } of state.videos) {
+      video.pause();
+      video.muted = muted;
+      video.volume = volume;
+      try { video.currentTime = time; } catch { /* live streams may not seek */ }
+    }
     document.documentElement.classList.remove("x-shot-capturing");
     state.selectedArticles.forEach((article) => article.classList.remove("x-shot-target"));
     state.expandedMedia.forEach(({ original, scroller, gallery, scrollLeft }) => {
@@ -199,6 +247,84 @@
     state.selectedArticles = [];
     state.expandedMedia = [];
     state.hiddenTransient = [];
+    state.videos = [];
+    state.recordingVideo = null;
+  }
+
+  async function positionVideo(capture) {
+    const video = state.recordingVideo;
+    if (!video || !document.contains(video)) return { ok: false, error: "所选视频已离开页面" };
+    video.pause();
+    video.muted = true;
+    try { await seekToStart(video); } catch { return { ok: false, error: "该视频不支持从开头播放" }; }
+    video.scrollIntoView({ block: "center", behavior: "instant" });
+    await animationFrames(2);
+    hideTransientUi();
+    const rect = video.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1 || rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
+      return { ok: false, error: "视频无法完整显示在当前窗口；请扩大窗口后重试" };
+    }
+    const selected = state.selectedArticles.at(-1);
+    const galleryImages = state.expandedMedia
+      .filter(({ gallery }) => selected?.contains(gallery))
+      .flatMap(({ gallery }) => Array.from(gallery.querySelectorAll("img")));
+    const photoImages = galleryImages.length ? galleryImages : Array.from(selected?.querySelectorAll('a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"]') || []);
+    const photoRects = photoImages
+      .map((image) => image.getBoundingClientRect())
+      .filter((box) => box.width > 0 && box.height > 0)
+      .map((box) => ({ left: box.left + scrollX - capture.left, top: box.top + scrollY - capture.top, width: box.width, height: box.height }));
+    return {
+      ok: true,
+      viewport: { width: innerWidth, height: innerHeight },
+      videoRect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      documentVideoRect: { left: rect.left + scrollX - capture.left, top: rect.top + scrollY - capture.top, width: rect.width, height: rect.height },
+      photoRects
+    };
+  }
+
+  async function playVideo() {
+    const video = state.recordingVideo;
+    if (!video) return { ok: false, error: "视频已不存在" };
+    try {
+      video.volume = 1;
+      video.muted = false;
+      await video.play();
+      clearInterval(state.unmuteTimer);
+      state.unmuteTimer = setInterval(() => {
+        if (!document.contains(video)) return;
+        video.muted = false;
+        video.volume = 1;
+      }, 250);
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: `视频无法播放：${error?.message || error}` };
+    }
+  }
+
+  async function waitForVideoEnd(maxDurationMs) {
+    const video = state.recordingVideo;
+    if (!video) return { ok: false, error: "视频已不存在" };
+    const boundedMs = Math.min(30000, Math.max(1000, maxDurationMs || 30000));
+    await new Promise((resolve) => {
+      if (video.ended) return resolve();
+      const done = () => { clearTimeout(timer); video.removeEventListener("ended", done); resolve(); };
+      const timer = setTimeout(done, boundedMs);
+      video.addEventListener("ended", done, { once: true });
+    });
+    video.pause();
+    clearInterval(state.unmuteTimer);
+    state.unmuteTimer = null;
+    return { ok: true };
+  }
+
+  function seekToStart(video) {
+    video.currentTime = 0;
+    if (!video.seeking) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(timer); video.removeEventListener("seeked", done); resolve(); };
+      const timer = setTimeout(done, 1500);
+      video.addEventListener("seeked", done, { once: true });
+    });
   }
 
   function hideTransientUi() {
@@ -230,22 +356,24 @@
     const processedScrollers = new Set();
     const processedBlocks = new Set();
     for (const article of articles) {
-      const mediaImages = article.querySelectorAll('a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"]');
-      for (const image of mediaImages) {
-        const scroller = findHorizontalScroller(image, article);
+      const mediaItems = article.querySelectorAll('a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"], video');
+      for (const item of mediaItems) {
+        const scroller = findHorizontalScroller(item, article);
         if (!scroller || processedScrollers.has(scroller)) continue;
         processedScrollers.add(scroller);
 
         const originalScrollLeft = scroller.scrollLeft;
         const items = await collectCarouselImages(scroller);
         scroller.scrollLeft = originalScrollLeft;
-        if (items.length < 2) continue;
+        if (items.length < 2 && !scroller.querySelector("video")) continue;
+        if (!items.length) continue;
 
         const mediaBlock = findMediaBlock(scroller, article);
         if (processedBlocks.has(mediaBlock)) continue;
         processedBlocks.add(mediaBlock);
         const gallery = buildMediaGallery(items);
-        mediaBlock.classList.add("x-shot-original-media-hidden");
+        // Mixed carousels must keep the playable video visible in the post.
+        if (!mediaBlock.querySelector("video")) mediaBlock.classList.add("x-shot-original-media-hidden");
         mediaBlock.insertAdjacentElement("afterend", gallery);
         state.expandedMedia.push({
           original: mediaBlock,
@@ -279,8 +407,8 @@
     return block;
   }
 
-  function findHorizontalScroller(image, article) {
-    let node = image.parentElement;
+  function findHorizontalScroller(mediaElement, article) {
+    let node = mediaElement.parentElement;
     while (node && node !== article) {
       if (node.clientWidth > 0 && node.scrollWidth > node.clientWidth + 4) {
         const style = getComputedStyle(node);

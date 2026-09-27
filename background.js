@@ -46,8 +46,9 @@ async function enterSelectionMode(tab) {
 }
 
 async function captureSelection(tabId, windowId, selection) {
-  if (captureInProgress) throw new Error("已有截图任务正在进行");
+  if (captureInProgress) throw new Error("已有截取任务正在进行");
   captureInProgress = true;
+  let recordingStarted = false;
 
   try {
     const prepared = await chrome.tabs.sendMessage(tabId, {
@@ -107,9 +108,51 @@ async function captureSelection(tabId, windowId, selection) {
 
     const result = await chrome.runtime.sendMessage({
       target: "offscreen",
-      type: "X_SHOT_FINISH"
+      type: "X_SHOT_FINISH",
+      forVideo: prepared.hasVideo
     });
     if (!result?.ok || !result.dataUrl) throw new Error(result?.error || "无法生成最终图片");
+
+    if (prepared.hasVideo) {
+      await notify(tabId, "progress", "正在准备低画质 MP4 录制…");
+      const layout = await chrome.tabs.sendMessage(tabId, {
+        type: "X_SHOT_VIDEO_POSITION",
+        capture
+      });
+      if (!layout?.ok) throw new Error(layout?.error || "无法定位视频");
+      const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+      const started = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "X_SHOT_RECORD_BEGIN",
+        streamId,
+        still: result.dataUrl,
+        capture,
+        layout
+      });
+      if (!started?.ok) throw new Error(started?.error || "无法开始录制 MP4");
+      recordingStarted = true;
+      if (!started.hasAudioTrack) throw new Error("无法取得标签页音轨，已取消录制");
+      const playing = await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_PLAY" });
+      if (!playing?.ok) throw new Error(playing?.error || "无法从头播放视频");
+      await notify(tabId, "progress", "正在录制视频，最长 30 秒…");
+      const waited = await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_WAIT", maxDurationMs: 30000 });
+      if (!waited?.ok) throw new Error(waited?.error || "视频播放中断");
+      await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_STOP" });
+      const slides = await chrome.runtime.sendMessage({ target: "offscreen", type: "X_SHOT_RECORD_SLIDES" });
+      if (!slides?.ok) throw new Error(slides?.error || "图片展示失败");
+      const recording = await chrome.runtime.sendMessage({ target: "offscreen", type: "X_SHOT_RECORD_FINISH" });
+      recordingStarted = false;
+      if (!recording?.ok || !recording.dataUrl) throw new Error(recording?.error || "无法完成 MP4 编码");
+      const filename = `X-Post-Video/x-post-${Date.now()}.mp4`;
+      const downloadId = await chrome.downloads.download({ url: recording.dataUrl, filename, saveAs: false, conflictAction: "uniquify" });
+      await waitForDownload(downloadId);
+      let shown = true;
+      try { chrome.downloads.show(downloadId); } catch { shown = false; }
+      await notify(tabId, "success", recording.truncated
+        ? `视频达到大小上限，已截短并保存至下载目录/${filename}；${shown ? "请在文件管理器按 Ctrl+C" : "请手动找到文件并复制"}`
+        : `MP4 已保存至下载目录/${filename}；${shown ? "请在文件管理器按 Ctrl+C" : "请手动找到文件并复制"}`);
+      return;
+    }
 
     // Offscreen documents cannot receive focus, so Chrome rejects their
     // Clipboard API calls. Return the PNG to the focused X tab for copying.
@@ -125,9 +168,37 @@ async function captureSelection(tabId, windowId, selection) {
       result.scaled ? `已缩放至 ${result.width} × ${result.height} 并复制` : "已复制到剪贴板"
     );
   } finally {
+    if (recordingStarted) {
+      await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_STOP" }).catch(() => {});
+      await chrome.runtime.sendMessage({ target: "offscreen", type: "X_SHOT_RECORD_ABORT" }).catch(() => {});
+    }
     await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_RESTORE" }).catch(() => {});
     captureInProgress = false;
   }
+}
+
+function waitForDownload(id) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => finish(new Error("MP4 下载超时")), 120000);
+    function finish(error) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      chrome.downloads.onChanged.removeListener(onChanged);
+      if (error) reject(error); else resolve();
+    }
+    function onChanged(change) {
+      if (change.id !== id || !change.state) return;
+      if (change.state.current === "complete") finish();
+      if (change.state.current === "interrupted") finish(new Error("MP4 下载中断"));
+    }
+    chrome.downloads.onChanged.addListener(onChanged);
+    chrome.downloads.search({ id }).then(([item]) => {
+      if (item?.state === "complete") finish();
+      if (item?.state === "interrupted") finish(new Error("MP4 下载中断"));
+    }).catch(finish);
+  });
 }
 
 async function captureVisibleFrame(windowId) {
@@ -151,8 +222,8 @@ async function ensureOffscreenDocument() {
   if (await chrome.offscreen.hasDocument()) return;
   await chrome.offscreen.createDocument({
     url: "offscreen.html",
-    reasons: ["BLOBS"],
-    justification: "拼接长截图并生成最终 PNG"
+    reasons: ["BLOBS", "USER_MEDIA"],
+    justification: "拼接帖子截图，并在用户选择视频时录制带音轨的 MP4"
   });
 }
 
