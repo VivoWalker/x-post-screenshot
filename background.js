@@ -138,8 +138,6 @@ async function captureSelection(tabId, windowId, selection) {
       const waited = await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_WAIT", maxDurationMs: 30000 });
       if (!waited?.ok) throw new Error(waited?.error || "视频播放中断");
       await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_STOP" });
-      const slides = await chrome.runtime.sendMessage({ target: "offscreen", type: "X_SHOT_RECORD_SLIDES" });
-      if (!slides?.ok) throw new Error(slides?.error || "图片展示失败");
       const recording = await chrome.runtime.sendMessage({ target: "offscreen", type: "X_SHOT_RECORD_FINISH" });
       recordingStarted = false;
       if (!recording?.ok || !recording.dataUrl) throw new Error(recording?.error || "无法完成 MP4 编码");

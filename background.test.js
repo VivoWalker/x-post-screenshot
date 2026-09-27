@@ -114,7 +114,8 @@ test('video capture records after tab audio capture, downloads MP4, and does not
   await harness.capture();
   assert.ok(harness.events.indexOf('STREAM_ID') < harness.events.indexOf('X_SHOT_VIDEO_PLAY'));
   assert.ok(harness.events.indexOf('X_SHOT_RECORD_BEGIN') < harness.events.indexOf('X_SHOT_VIDEO_PLAY'));
-  assert.ok(harness.events.indexOf('X_SHOT_VIDEO_STOP') < harness.events.indexOf('X_SHOT_RECORD_SLIDES'));
+  assert.equal(harness.events.includes('X_SHOT_RECORD_SLIDES'), false);
+  assert.ok(harness.events.indexOf('X_SHOT_VIDEO_STOP') < harness.events.indexOf('X_SHOT_RECORD_FINISH'));
   assert.ok(harness.events.indexOf('DOWNLOAD') < harness.events.indexOf('SHOW_FILE'));
   assert.equal(harness.getDownloaded().filename.startsWith('X-Post-Video/'), true);
   assert.equal(harness.messages.includes('X_SHOT_COPY'), false);

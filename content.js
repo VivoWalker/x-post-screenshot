@@ -283,12 +283,24 @@
       .map((image) => image.getBoundingClientRect())
       .filter((box) => box.width > 0 && box.height > 0)
       .map((box) => ({ left: box.left + scrollX - capture.left, top: box.top + scrollY - capture.top, width: box.width, height: box.height }));
+    const textRect = selected?.querySelector('[data-testid="tweetText"]')?.getBoundingClientRect();
+    const contentLeft = Math.max(capture.left - scrollX, Math.min(rect.left, textRect?.left ?? rect.left));
+    const contentRight = Math.min(capture.left - scrollX + capture.width, Math.max(rect.right, textRect?.right ?? rect.right));
+    const videoTop = rect.top + scrollY - capture.top;
+    const mediaTop = Math.min(videoTop, ...photoRects.map((photo) => photo.top));
+    const actionGroup = selected?.querySelector('[data-testid="reply"]')?.closest('[role="group"]');
+    const actionTop = actionGroup?.getBoundingClientRect().top + scrollY - capture.top;
+    const mediaBottom = Math.max(videoTop + rect.height, ...photoRects.map((photo) => photo.top + photo.height));
     return {
       ok: true,
       viewport: { width: innerWidth, height: innerHeight },
       videoRect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
       documentVideoRect: { left: rect.left + scrollX - capture.left, top: rect.top + scrollY - capture.top, width: rect.width, height: rect.height },
-      photoRects
+      photoRects,
+      contentArea: { left: contentLeft + scrollX - capture.left, width: contentRight - contentLeft },
+      mediaTop,
+      footerTop: Number.isFinite(actionTop) && actionTop >= mediaBottom ? actionTop : mediaBottom,
+      backgroundColor: getComputedStyle(document.body).backgroundColor || "#000"
     };
   }
 

@@ -28,7 +28,6 @@ async function handleMessage(message) {
   if (message.type === "X_SHOT_FRAME") return addFrame(message.dataUrl, message.frame);
   if (message.type === "X_SHOT_FINISH") return finish(Boolean(message.forVideo));
   if (message.type === "X_SHOT_RECORD_BEGIN") return beginRecording(message);
-  if (message.type === "X_SHOT_RECORD_SLIDES") return showPhotoSlides();
   if (message.type === "X_SHOT_RECORD_FINISH") return finishRecording();
   if (message.type === "X_SHOT_RECORD_ABORT") { abortRecording(); return { ok: true }; }
   return { ok: false, error: "未知的图片处理请求" };
@@ -140,10 +139,10 @@ async function beginRecording({ streamId, still, capture, layout }) {
   ].find((type) => MediaRecorder.isTypeSupported(type));
   if (!mimeType) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
   const base = await loadImage(still);
-  const ratio = Math.min(1, VIDEO_LIMITS.width / base.naturalWidth, VIDEO_LIMITS.height / base.naturalHeight);
+  const composition = createVideoComposition(capture, layout, VIDEO_LIMITS);
   const canvas = document.createElement("canvas");
-  canvas.width = Math.max(2, Math.floor(base.naturalWidth * ratio / 2) * 2);
-  canvas.height = Math.max(2, Math.floor(base.naturalHeight * ratio / 2) * 2);
+  canvas.width = composition.width;
+  canvas.height = composition.height;
   const context = canvas.getContext("2d", { alpha: false });
   const tabStream = await navigator.mediaDevices.getUserMedia({
     audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } },
@@ -162,7 +161,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
       videoBitsPerSecond: VIDEO_LIMITS.videoBitsPerSecond,
       audioBitsPerSecond: VIDEO_LIMITS.audioBitsPerSecond
     });
-    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, phase: "video", slide: -1, tooLarge: false, error: null, drawTimer: null };
+    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, tooLarge: false, error: null, drawTimer: null };
     recorder.ondataavailable = (event) => {
       if (event.data?.size) chunks.push(event.data);
       if (chunks.reduce((sum, chunk) => sum + chunk.size, 0) > VIDEO_LIMITS.maxBytes) {
@@ -183,48 +182,88 @@ async function beginRecording({ streamId, still, capture, layout }) {
   }
 }
 
+function createVideoComposition(capture, layout, limits) {
+  const mediaTop = Math.max(0, Math.min(capture.height, layout.mediaTop ?? layout.documentVideoRect.top));
+  const footerTop = Math.max(mediaTop, Math.min(capture.height, layout.footerTop ?? capture.height));
+  const contentLeft = Math.max(0, Math.min(capture.width, layout.contentArea?.left ?? 0));
+  const contentWidth = Math.max(1, Math.min(capture.width - contentLeft, layout.contentArea?.width ?? capture.width));
+  const videoHeight = contentWidth * layout.videoRect.height / layout.videoRect.width;
+  const rowHeight = contentWidth * 0.22;
+  const rowCount = Math.ceil(layout.photoRects.length / 2);
+  const photoHeight = rowCount ? rowCount * rowHeight + (rowCount - 1) * 4 : 0;
+  const totalHeight = mediaTop + videoHeight + photoHeight + capture.height - footerTop;
+  const scale = Math.min(1, limits.width / capture.width, limits.height / totalHeight);
+  const width = Math.max(2, Math.floor(capture.width * scale / 2) * 2);
+  const actualScale = width / capture.width;
+  const height = Math.max(2, Math.floor(totalHeight * actualScale / 2) * 2);
+  const topHeight = Math.round(mediaTop * actualScale);
+  const videoBottom = Math.round((mediaTop + videoHeight) * actualScale);
+  const videoX = Math.round(contentLeft * actualScale);
+  const videoWidth = Math.min(width - videoX, Math.round(contentWidth * actualScale));
+  const video = { x: videoX, y: topHeight, width: videoWidth, height: videoBottom - topHeight };
+  const gap = Math.max(1, Math.round(4 * actualScale));
+  const thumbHeight = Math.round(rowHeight * actualScale);
+  const thumbWidth = Math.floor((videoWidth - gap) / 2);
+  const thumbnails = layout.photoRects.map((source, index) => ({
+    source,
+    x: index % 2 ? videoX + videoWidth - thumbWidth : videoX,
+    y: videoBottom + Math.floor(index / 2) * (thumbHeight + gap),
+    width: thumbWidth,
+    height: thumbHeight
+  }));
+  const footerY = rowCount ? thumbnails.at(-1).y + thumbHeight : videoBottom;
+  return {
+    width,
+    height,
+    top: { y: 0, height: topHeight, sourceHeight: mediaTop },
+    video,
+    thumbnails,
+    footer: { y: footerY, height: Math.max(0, height - footerY), sourceTop: footerTop, sourceHeight: capture.height - footerTop }
+  };
+}
+
 function drawRecordingFrame() {
   const current = recording;
   if (!current) return;
-  const { base, canvas, context, capture, layout } = current;
-  context.drawImage(base, 0, 0, canvas.width, canvas.height);
-  const destination = layout.documentVideoRect;
-  const dx = destination.left / capture.width * canvas.width;
-  const dy = destination.top / capture.height * canvas.height;
-  const dw = destination.width / capture.width * canvas.width;
-  const dh = destination.height / capture.height * canvas.height;
-  if (current.phase === "video" && current.tabVideo.readyState >= 2) {
+  const { base, context, capture, layout, composition } = current;
+  context.fillStyle = layout.backgroundColor || "#000";
+  context.fillRect(0, 0, composition.width, composition.height);
+  if (composition.top.height > 0) {
+    context.drawImage(base, 0, 0, base.naturalWidth, composition.top.sourceHeight / capture.height * base.naturalHeight,
+      0, 0, composition.width, composition.top.height);
+  }
+  const destination = composition.video;
+  if (current.tabVideo.readyState >= 2) {
     const source = layout.videoRect;
     const sx = source.left / layout.viewport.width * current.tabVideo.videoWidth;
     const sy = source.top / layout.viewport.height * current.tabVideo.videoHeight;
     const sw = source.width / layout.viewport.width * current.tabVideo.videoWidth;
     const sh = source.height / layout.viewport.height * current.tabVideo.videoHeight;
-    context.drawImage(current.tabVideo, sx, sy, sw, sh, dx, dy, dw, dh);
-  } else if (current.phase === "slide") {
-    const photo = layout.photoRects[current.slide];
-    if (!photo) return;
+    context.drawImage(current.tabVideo, sx, sy, sw, sh, destination.x, destination.y, destination.width, destination.height);
+  } else {
+    const source = layout.documentVideoRect;
+    context.drawImage(base, source.left / capture.width * base.naturalWidth, source.top / capture.height * base.naturalHeight,
+      source.width / capture.width * base.naturalWidth, source.height / capture.height * base.naturalHeight,
+      destination.x, destination.y, destination.width, destination.height);
+  }
+  for (const thumb of composition.thumbnails) {
+    const photo = thumb.source;
     const sx = photo.left / capture.width * base.naturalWidth;
     const sy = photo.top / capture.height * base.naturalHeight;
     const sw = photo.width / capture.width * base.naturalWidth;
     const sh = photo.height / capture.height * base.naturalHeight;
-    const fitted = Math.min(dw / sw, dh / sh);
+    const fitted = Math.min(thumb.width / sw, thumb.height / sh);
     context.fillStyle = "#000";
-    context.fillRect(dx, dy, dw, dh);
-    context.drawImage(base, sx, sy, sw, sh, dx + (dw - sw * fitted) / 2, dy + (dh - sh * fitted) / 2, sw * fitted, sh * fitted);
+    context.fillRect(thumb.x, thumb.y, thumb.width, thumb.height);
+    context.drawImage(base, sx, sy, sw, sh,
+      thumb.x + (thumb.width - sw * fitted) / 2, thumb.y + (thumb.height - sh * fitted) / 2,
+      sw * fitted, sh * fitted);
   }
-}
-
-async function showPhotoSlides() {
-  if (!recording) throw new Error("视频录制任务不存在");
-  if (recording.recorder.state === "inactive") return { ok: true, truncated: true };
-  for (let index = 0; index < recording.layout.photoRects.length; index += 1) {
-    recording.phase = "slide";
-    recording.slide = index;
-    drawRecordingFrame();
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    if (!recording || recording.recorder.state === "inactive") break;
+  if (composition.footer.height > 0 && composition.footer.sourceHeight > 0) {
+    context.drawImage(base, 0, composition.footer.sourceTop / capture.height * base.naturalHeight,
+      base.naturalWidth, composition.footer.sourceHeight / capture.height * base.naturalHeight,
+      0, composition.footer.y, composition.width, composition.footer.height);
   }
-  return { ok: true };
 }
 
 async function finishRecording() {
