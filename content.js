@@ -7,6 +7,17 @@ function xShotFooterTop(article, mediaBottom, scrollY, captureTop) {
   return actionTops.length ? Math.max(...actionTops) : mediaBottom;
 }
 
+function xShotHideProfilePreviews(root, hiddenTransient) {
+  const previews = root.querySelectorAll('[data-testid*="hovercard" i], [role="tooltip"]');
+  for (const preview of previews) {
+    const testId = preview.getAttribute("data-testid")?.toLowerCase() || "";
+    if (!testId.includes("hovercard") && preview.getAttribute("role") !== "tooltip") continue;
+    if (preview.classList.contains("x-shot-transient-hidden")) continue;
+    preview.classList.add("x-shot-transient-hidden");
+    hiddenTransient.push(preview);
+  }
+}
+
 (() => {
   if (globalThis.__xShotLoaded) return;
   globalThis.__xShotLoaded = true;
@@ -357,6 +368,7 @@ function xShotFooterTop(article, mediaBottom, scrollY, captureTop) {
   }
 
   function hideTransientUi() {
+    xShotHideProfilePreviews(document, state.hiddenTransient);
     const newPostPattern = /(?:有新(?:的)?帖(?:子|文)|查看新帖(?:子|文)|show\s+(?:\d+\s+)?new posts?|see new posts?|new posts? available|新しいポスト|nuevas publicaciones|nouveaux posts)/i;
     const immersiveTranslateOverlays = document.querySelectorAll('#immersive-translate-popup');
     for (const overlay of immersiveTranslateOverlays) {
