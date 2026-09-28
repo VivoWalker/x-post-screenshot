@@ -105,6 +105,7 @@ test('recorded frame draws text, moving video, thumbnails, then interactions', (
     layout,
     composition: context.createVideoComposition(capture, layout, { width: 720, height: 1280 }),
     tabVideo: live,
+    liveCrop: { x: 100, y: 100, width: 500, height: 250 },
     context: {
       fillRect() {},
       drawImage(...args) { draws.push({ source: args[0].tag, x: args[5], y: args[6], width: args[7], height: args[8] }); }
@@ -115,6 +116,130 @@ test('recorded frame draws text, moving video, thumbnails, then interactions', (
   assert.deepEqual(draws[1], { source: 'live-video', x: 0, y: 200, width: 600, height: 300 });
   assert.deepEqual(draws.slice(2, 4).map(({ y }) => y), [500, 500]);
   assert.equal(draws[4].y, 632);
+});
+
+test('uncertain image ownership records over the complete original post layout', () => {
+  const context = loadOffscreen();
+  const capture = { width: 600, height: 1000 };
+  const layout = {
+    preservePostLayout: true,
+    backgroundColor: '#000',
+    documentVideoRect: { left: 100, top: 200, width: 400, height: 250 },
+    videoRect: { width: 400, height: 250 },
+    mediaTop: 200,
+    footerTop: 850,
+    photoRects: [{ left: 100, top: 600, width: 150, height: 200 }]
+  };
+  const draws = [];
+  const base = { tag: 'still', naturalWidth: 300, naturalHeight: 500 };
+  const live = { tag: 'live-video', readyState: 2, videoWidth: 800, videoHeight: 600 };
+  const composition = context.createVideoComposition(capture, layout, { width: 720, height: 1280 }, 300);
+  context.fixture = {
+    base, capture, layout, composition, tabVideo: live,
+    liveCrop: { x: 150, y: 100, width: 400, height: 250 },
+    context: {
+      fillRect() {},
+      drawImage(...args) { draws.push({ source: args[0].tag, x: args[5], y: args[6], width: args[7], height: args[8] }); }
+    }
+  };
+  vm.runInContext('recording = fixture; drawRecordingFrame()', context);
+
+  assert.deepEqual([composition.width, composition.height], [300, 500]);
+  assert.deepEqual(draws, [
+    { source: 'still', x: 0, y: 0, width: 300, height: 500 },
+    { source: 'live-video', x: 50, y: 100, width: 200, height: 125 }
+  ]);
+});
+
+test('calibrated live crop excludes text and controls when the tab stream has margins', () => {
+  const context = loadOffscreen();
+  const width = 1000;
+  const height = 700;
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  function marker(x, y, color) {
+    for (let py = y; py < y + 24; py += 1) {
+      for (let px = x; px < x + 24; px += 1) {
+        const offset = (py * width + px) * 4;
+        pixels.set([...color, 255], offset);
+      }
+    }
+  }
+  // CSS viewport 800 x 600 maps to pixels x = 100 + cssX, y = 50 + cssY.
+  marker(108, 58, [255, 0, 255]);
+  marker(868, 618, [0, 255, 255]);
+  const calibration = context.calibrateTabStream({ data: pixels, width, height }, {
+    first: { x: 20, y: 20 }, second: { x: 780, y: 580 }
+  });
+  const crop = context.mapVideoRectToStream(
+    { left: 200, top: 150, width: 300, height: 250 }, calibration
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(crop)), { x: 300, y: 200, width: 300, height: 250 });
+});
+
+test('calibration rejects a stream without both visible markers', () => {
+  const context = loadOffscreen();
+  const pixels = new Uint8ClampedArray(100 * 100 * 4);
+  assert.throws(() => context.calibrateTabStream({ data: pixels, width: 100, height: 100 }, {
+    first: { x: 16, y: 16 }, second: { x: 84, y: 84 }
+  }), /校准/);
+});
+
+test('calibration rejects similarly colored page pixels outside the markers', () => {
+  const context = loadOffscreen();
+  const width = 800;
+  const height = 600;
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  function marker(x, y, size, color) {
+    for (let py = y; py < y + size; py += 1) {
+      for (let px = x; px < x + size; px += 1) pixels.set([...color, 255], (py * width + px) * 4);
+    }
+  }
+  marker(8, 8, 24, [255, 0, 255]);
+  marker(768, 568, 24, [0, 255, 255]);
+  marker(160, 120, 8, [255, 0, 255]);
+  assert.throws(() => context.calibrateTabStream({ data: pixels, width, height }, {
+    first: { x: 20, y: 20 }, second: { x: 780, y: 580 }
+  }), /校准/);
+});
+
+test('calibration rejects a substantially covered marker', () => {
+  const context = loadOffscreen();
+  const width = 800;
+  const height = 600;
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  for (let y = 8; y < 32; y += 1) {
+    for (let x = 8; x < 20; x += 1) pixels.set([255, 0, 255, 255], (y * width + x) * 4);
+  }
+  for (let y = 568; y < 592; y += 1) {
+    for (let x = 768; x < 792; x += 1) pixels.set([0, 255, 255, 255], (y * width + x) * 4);
+  }
+  assert.throws(() => context.calibrateTabStream({ data: pixels, width, height }, {
+    first: { x: 20, y: 20 }, second: { x: 780, y: 580 }
+  }), /校准/);
+});
+
+test('calibrated crop rejects invalid video geometry instead of drawing outside the stream', () => {
+  const context = loadOffscreen();
+  const calibration = { scaleX: 1, scaleY: 1, offsetX: 100, offsetY: 50, width: 1000, height: 700 };
+  assert.throws(() => context.mapVideoRectToStream({ left: 200, top: 150, width: NaN, height: 250 }, calibration), /录屏区域/);
+});
+
+test('recording stops if tab stream dimensions change after calibration', () => {
+  const context = loadOffscreen();
+  let stops = 0;
+  context.fixture = {
+    tabVideo: { readyState: 2, videoWidth: 1200, videoHeight: 700 },
+    calibration: { width: 1000, height: 700 },
+    recorder: { state: 'recording', stop() { stops += 1; } },
+    context: { fillRect() {}, drawImage() {} },
+    capture: { width: 600, height: 900 },
+    layout: { backgroundColor: '#000' },
+    liveCrop: { x: 0, y: 0, width: 100, height: 100 },
+    composition: { width: 600, height: 900, top: { height: 0 }, video: { x: 0, y: 0, width: 600, height: 900 }, thumbnails: [], footer: { height: 0 } }
+  };
+  vm.runInContext('recording = fixture; drawRecordingFrame()', context);
+  assert.match(context.fixture.error.message, /录屏尺寸/);
+  assert.equal(stops, 1);
 });
 
 test('composition keeps half-resolution screenshot pixels instead of dropping to CSS pixels', () => {
@@ -167,12 +292,18 @@ function createRecordingHarness() {
   context.navigator = { mediaDevices: { async getUserMedia() {
     return { getAudioTracks: () => [audioTrack], getTracks: () => [audioTrack, tabVideoTrack] };
   } } };
+  const markerPixels = new Uint8ClampedArray(800 * 600 * 4);
+  for (const [x0, y0, color] of [[8, 8, [255, 0, 255]], [768, 568, [0, 255, 255]]]) {
+    for (let y = y0; y < y0 + 24; y += 1) {
+      for (let x = x0; x < x0 + 24; x += 1) markerPixels.set([...color, 255], (y * 800 + x) * 4);
+    }
+  }
   context.document = { createElement(type) {
-    if (type === 'video') return { readyState: 0, async play() {} };
+    if (type === 'video') return { readyState: 2, videoWidth: 800, videoHeight: 600, async play() {} };
     return {
       width: 0,
       height: 0,
-      getContext() { return { fillRect() {}, drawImage() {} }; },
+      getContext() { return { fillRect() {}, drawImage() {}, getImageData() { return { data: markerPixels, width: 800, height: 600 }; } }; },
       captureStream() { return { getVideoTracks: () => [canvasVideoTrack], getTracks: () => [canvasVideoTrack] }; }
     };
   } };
@@ -202,9 +333,20 @@ test('recorder requests about 8000 kbps for the MP4 video track', async () => {
   harness.context.abortRecording();
 });
 
+test('recording waits for post-capture marker calibration before it starts', async () => {
+  const harness = createRecordingHarness();
+  await harness.start();
+  assert.throws(() => harness.context.startRecording({ left: 100, top: 100, width: 500, height: 250 }), /校准/);
+  await harness.context.calibrateRecording({ first: { x: 20, y: 20 }, second: { x: 780, y: 580 } });
+  assert.equal(harness.context.startRecording({ left: 100, top: 100, width: 500, height: 250 }).ok, true);
+  harness.context.abortRecording();
+});
+
 test('recording continues below 40 MB and stops after crossing that cap', async () => {
   const harness = createRecordingHarness();
   await harness.start();
+  await harness.context.calibrateRecording({ first: { x: 20, y: 20 }, second: { x: 780, y: 580 } });
+  harness.context.startRecording({ left: 100, top: 100, width: 500, height: 250 });
   const recorder = harness.recorder();
   recorder.ondataavailable({ data: { size: 35_000_000 } });
   assert.equal(recorder.stopCalls, 0);
@@ -222,6 +364,8 @@ test('size-limited MP4 waits for the final data chunk after recorder becomes ina
     readAsDataURL() { this.result = 'data:video/mp4;base64,AAAA'; this.onload(); }
   };
   await harness.start();
+  await harness.context.calibrateRecording({ first: { x: 20, y: 20 }, second: { x: 780, y: 580 } });
+  harness.context.startRecording({ left: 100, top: 100, width: 500, height: 250 });
   const recorder = harness.recorder();
   recorder.stop = () => {
     recorder.state = 'inactive';

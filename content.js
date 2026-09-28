@@ -7,6 +7,59 @@ function xShotFooterTop(article, mediaBottom, scrollY, captureTop) {
   return actionTops.length ? Math.max(...actionTops) : mediaBottom;
 }
 
+function xShotVideoMediaSources(article, video, expandedMedia) {
+  const mainLink = article?.querySelector('time')?.closest('a[href*="/status/"]');
+  const mainStatusId = mainLink?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1];
+  const quoteCards = new Set();
+  let preservePostLayout = (article?.querySelectorAll('[data-testid="tweetText"]')?.length || 0) > 1;
+  if (mainStatusId) {
+    preservePostLayout ||= Array.from(article.querySelectorAll('a[href*="/status/"]'))
+      .some((link) => {
+        const linkedId = link.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1];
+        return linkedId && linkedId !== mainStatusId;
+      });
+  }
+  const classifyMedia = (element) => {
+    const markedCard = element.closest('[data-testid="quoteTweet"]');
+    if (markedCard) return { owner: 'quote', card: markedCard };
+    const mediaLink = element.closest('a[href*="/status/"]') || element.querySelector?.('a[href*="/status/"]');
+    const mediaStatusId = mediaLink?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1];
+    if (!mainStatusId || !mediaStatusId) return { owner: 'unknown' };
+    if (mainStatusId === mediaStatusId) return { owner: 'main' };
+    let card = element;
+    while (card.parentElement && card.parentElement !== article && !card.parentElement.contains(video)) {
+      card = card.parentElement;
+    }
+    return { owner: 'quote', card };
+  };
+  const galleries = expandedMedia.filter(({ gallery }) => article?.contains(gallery));
+  const mainGalleryImages = galleries.flatMap(({ original, gallery }) => {
+    const classification = classifyMedia(original);
+    if (classification.owner === 'main') return Array.from(gallery.querySelectorAll('img'));
+    preservePostLayout = true;
+    if (classification.card) quoteCards.add(classification.card);
+    return [];
+  });
+  const directPhotos = Array.from(article?.querySelectorAll('a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"]') || [])
+    .filter((image) => {
+      const classification = classifyMedia(image);
+      if (classification.owner === 'main') return true;
+      preservePostLayout = true;
+      if (classification.card) quoteCards.add(classification.card);
+      return false;
+    });
+  return { photoImages: mainGalleryImages.length ? mainGalleryImages : directPhotos,
+    quoteCards: Array.from(quoteCards), preservePostLayout };
+}
+
+function xShotVideoFooterTop(article, quoteCards, mediaBottom, scrollY, captureTop) {
+  const actionTop = xShotFooterTop(article, mediaBottom, scrollY, captureTop);
+  const quoteTops = quoteCards
+    .map((card) => card.getBoundingClientRect().top + scrollY - captureTop)
+    .filter((top) => Number.isFinite(top) && top >= mediaBottom);
+  return quoteTops.length ? Math.min(actionTop, ...quoteTops) : actionTop;
+}
+
 function xShotHideProfilePreviews(root, hiddenTransient) {
   const previews = root.querySelectorAll('[data-testid*="hovercard" i], [role="tooltip"]');
   for (const preview of previews) {
@@ -16,6 +69,14 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
     preview.classList.add("x-shot-transient-hidden");
     hiddenTransient.push(preview);
   }
+}
+
+function xShotVideoGeometryChanged(expected, current) {
+  if (!expected || !current) return true;
+  if (expected.viewportWidth !== current.viewportWidth || expected.viewportHeight !== current.viewportHeight) return true;
+  return ["left", "top", "width", "height"].some((key) =>
+    !Number.isFinite(expected[key]) || !Number.isFinite(current[key]) || Math.abs(expected[key] - current[key]) > 1
+  );
 }
 
 (() => {
@@ -33,6 +94,8 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
     hiddenTransient: [],
     videos: [],
     recordingVideo: null,
+    recordingGeometry: null,
+    calibrationMarkers: [],
     unmuteTimer: null,
     originalScrollY: 0,
     toastTimer: null
@@ -62,6 +125,14 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
     }
     if (message?.type === "X_SHOT_VIDEO_PLAY") {
       playVideo().then(sendResponse);
+      return true;
+    }
+    if (message?.type === "X_SHOT_VIDEO_MARKERS") {
+      sendResponse(readCalibrationMarkers());
+      return;
+    }
+    if (message?.type === "X_SHOT_VIDEO_READY") {
+      readyVideo().then(sendResponse);
       return true;
     }
     if (message?.type === "X_SHOT_VIDEO_WAIT") {
@@ -255,6 +326,7 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
   }
 
   function restorePage() {
+    removeCalibrationMarkers();
     clearInterval(state.unmuteTimer);
     state.unmuteTimer = null;
     for (const { video, muted, volume, time } of state.videos) {
@@ -279,6 +351,7 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
     state.hiddenTransient = [];
     state.videos = [];
     state.recordingVideo = null;
+    state.recordingGeometry = null;
   }
 
   async function positionVideo(capture) {
@@ -290,15 +363,14 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
     video.scrollIntoView({ block: "center", behavior: "instant" });
     await animationFrames(2);
     hideTransientUi();
+    showCalibrationMarkers();
+    await animationFrames(2);
     const rect = video.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1 || rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
       return { ok: false, error: "视频无法完整显示在当前窗口；请扩大窗口后重试" };
     }
     const selected = state.selectedArticles.at(-1);
-    const galleryImages = state.expandedMedia
-      .filter(({ gallery }) => selected?.contains(gallery))
-      .flatMap(({ gallery }) => Array.from(gallery.querySelectorAll("img")));
-    const photoImages = galleryImages.length ? galleryImages : Array.from(selected?.querySelectorAll('a[href*="/photo/"] img, img[src*="pbs.twimg.com/media"]') || []);
+    const { photoImages, quoteCards, preservePostLayout } = xShotVideoMediaSources(selected, video, state.expandedMedia);
     const photoRects = photoImages
       .map((image) => image.getBoundingClientRect())
       .filter((box) => box.width > 0 && box.height > 0)
@@ -315,11 +387,56 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
       videoRect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
       documentVideoRect: { left: rect.left + scrollX - capture.left, top: rect.top + scrollY - capture.top, width: rect.width, height: rect.height },
       photoRects,
+      preservePostLayout,
       contentArea: { left: contentLeft + scrollX - capture.left, width: contentRight - contentLeft },
       mediaTop,
-      footerTop: xShotFooterTop(selected, mediaBottom, scrollY, capture.top),
+      footerTop: xShotVideoFooterTop(selected, quoteCards, mediaBottom, scrollY, capture.top),
       backgroundColor: getComputedStyle(document.body).backgroundColor || "#000"
     };
+  }
+
+  function removeCalibrationMarkers() {
+    state.calibrationMarkers.forEach((marker) => marker.remove());
+    state.calibrationMarkers = [];
+  }
+
+  function showCalibrationMarkers() {
+    removeCalibrationMarkers();
+    const definitions = [
+      ["left:8px;top:8px", "#ff00ff"],
+      ["right:8px;bottom:8px", "#00ffff"]
+    ];
+    for (const [position, color] of definitions) {
+      const marker = document.createElement("div");
+      marker.style.cssText = `position:fixed!important;${position};width:24px!important;height:24px!important;background:${color}!important;z-index:2147483647!important;pointer-events:none!important;opacity:1!important;border:0!important;box-shadow:none!important;mix-blend-mode:normal!important`;
+      document.body.appendChild(marker);
+      state.calibrationMarkers.push(marker);
+    }
+  }
+
+  function readCalibrationMarkers() {
+    if (state.calibrationMarkers.length !== 2 || state.calibrationMarkers.some((marker) => !document.contains(marker))) {
+      return { ok: false, error: "录屏校准点已消失" };
+    }
+    const [first, second] = state.calibrationMarkers.map((marker) => {
+      const rect = marker.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    });
+    return { ok: true, markers: { first, second } };
+  }
+
+  async function readyVideo() {
+    removeCalibrationMarkers();
+    await animationFrames(2);
+    const video = state.recordingVideo;
+    if (!video || !document.contains(video)) return { ok: false, error: "所选视频已离开页面" };
+    const rect = video.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1 || rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
+      return { ok: false, error: "视频无法完整显示在当前窗口；请扩大窗口后重试" };
+    }
+    const videoRect = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    state.recordingGeometry = { ...videoRect, viewportWidth: innerWidth, viewportHeight: innerHeight };
+    return { ok: true, videoRect };
   }
 
   async function playVideo() {
@@ -345,16 +462,35 @@ function xShotHideProfilePreviews(root, hiddenTransient) {
     const video = state.recordingVideo;
     if (!video) return { ok: false, error: "视频已不存在" };
     const boundedMs = Math.min(30000, Math.max(1000, maxDurationMs || 30000));
-    await new Promise((resolve) => {
-      if (video.ended) return resolve();
-      const done = () => { clearTimeout(timer); video.removeEventListener("ended", done); resolve(); };
-      const timer = setTimeout(done, boundedMs);
+    const result = await new Promise((resolve) => {
+      let timer;
+      let monitor;
+      const finish = (value) => {
+        clearTimeout(timer);
+        clearInterval(monitor);
+        video.removeEventListener("ended", done);
+        resolve(value);
+      };
+      const done = () => finish({ ok: true });
+      const check = () => {
+        if (!document.contains(video)) return finish({ ok: false, error: "视频在录制中离开页面" });
+        const rect = video.getBoundingClientRect();
+        const current = { left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+          viewportWidth: innerWidth, viewportHeight: innerHeight };
+        if (xShotVideoGeometryChanged(state.recordingGeometry, current)) {
+          finish({ ok: false, error: "视频位置在录制中变化，已停止以避免画面重影；请重试" });
+        }
+      };
+      timer = setTimeout(done, boundedMs);
+      monitor = setInterval(check, 100);
       video.addEventListener("ended", done, { once: true });
+      if (video.ended) done();
+      else check();
     });
     video.pause();
     clearInterval(state.unmuteTimer);
     state.unmuteTimer = null;
-    return { ok: true };
+    return result;
   }
 
   function seekToStart(video) {

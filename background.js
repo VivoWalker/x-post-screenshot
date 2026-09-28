@@ -132,6 +132,22 @@ async function captureSelection(tabId, windowId, selection) {
       if (!started?.ok) throw new Error(started?.error || "无法开始录制 MP4");
       recordingStarted = true;
       if (!started.hasAudioTrack) throw new Error("无法取得标签页音轨，已取消录制");
+      const markers = await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_MARKERS" });
+      if (!markers?.ok) throw new Error(markers?.error || "无法读取录屏校准点");
+      const calibrated = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "X_SHOT_RECORD_CALIBRATE",
+        markers: markers.markers
+      });
+      if (!calibrated?.ok) throw new Error(calibrated?.error || "无法校准录屏位置");
+      const ready = await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_READY" });
+      if (!ready?.ok) throw new Error(ready?.error || "无法读取校准后的视频位置");
+      const recordStarted = await chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "X_SHOT_RECORD_START",
+        videoRect: ready.videoRect
+      });
+      if (!recordStarted?.ok) throw new Error(recordStarted?.error || "无法开始录制 MP4");
       const playing = await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_VIDEO_PLAY" });
       if (!playing?.ok) throw new Error(playing?.error || "无法从头播放视频");
       await notify(tabId, "progress", "正在录制视频，最长 30 秒…");

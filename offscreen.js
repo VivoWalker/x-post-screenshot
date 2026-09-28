@@ -28,6 +28,8 @@ async function handleMessage(message) {
   if (message.type === "X_SHOT_FRAME") return addFrame(message.dataUrl, message.frame);
   if (message.type === "X_SHOT_FINISH") return finish(Boolean(message.forVideo));
   if (message.type === "X_SHOT_RECORD_BEGIN") return beginRecording(message);
+  if (message.type === "X_SHOT_RECORD_CALIBRATE") return calibrateRecording(message.markers);
+  if (message.type === "X_SHOT_RECORD_START") return startRecording(message.videoRect);
   if (message.type === "X_SHOT_RECORD_FINISH") return finishRecording();
   if (message.type === "X_SHOT_RECORD_ABORT") { abortRecording(); return { ok: true }; }
   return { ok: false, error: "未知的图片处理请求" };
@@ -161,7 +163,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
       videoBitsPerSecond: VIDEO_LIMITS.videoBitsPerSecond,
       audioBitsPerSecond: VIDEO_LIMITS.audioBitsPerSecond
     });
-    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
+    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
     current.stopPromise = new Promise((resolve) => {
       recorder.addEventListener("stop", resolve, { once: true });
       recorder.addEventListener("error", resolve, { once: true });
@@ -175,9 +177,6 @@ async function beginRecording({ streamId, still, capture, layout }) {
     };
     recorder.onerror = (event) => { current.error = event.error || new Error("MP4 编码失败"); };
     recording = current;
-    drawRecordingFrame();
-    current.drawTimer = setInterval(drawRecordingFrame, 1000 / VIDEO_LIMITS.fps);
-    recorder.start(1000);
     return { ok: true, width: canvas.width, height: canvas.height, hasAudioTrack: tabStream.getAudioTracks().length > 0 };
   } catch (error) {
     if (recording) abortRecording();
@@ -186,7 +185,135 @@ async function beginRecording({ streamId, still, capture, layout }) {
   }
 }
 
+async function calibrateRecording(markers) {
+  if (!recording || recording.drawTimer) throw new Error("录制状态异常");
+  recording.calibration = await waitForTabCalibration(recording.tabVideo, markers);
+  return { ok: true };
+}
+
+async function waitForTabCalibration(tabVideo, markers) {
+  if (!markers?.first || !markers?.second) throw new Error("缺少录屏校准点");
+  const probe = document.createElement("canvas");
+  const probeContext = probe.getContext("2d", { willReadFrequently: true });
+  const deadline = Date.now() + 4000;
+  while (Date.now() < deadline) {
+    if (tabVideo.videoWidth > 0 && tabVideo.videoHeight > 0 && tabVideo.readyState >= 2) {
+      probe.width = tabVideo.videoWidth;
+      probe.height = tabVideo.videoHeight;
+      probeContext.drawImage(tabVideo, 0, 0);
+      try {
+        return calibrateTabStream(probeContext.getImageData(0, 0, probe.width, probe.height), markers);
+      } catch { /* Wait until both calibration markers reach the tab stream. */ }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  throw new Error("无法校准录屏位置，请重试");
+}
+
+function calibrateTabStream(imageData, markers) {
+  const { data, width, height } = imageData;
+  function locate(kind) {
+    const first = kind === "first";
+    const fromX = first ? 0 : Math.floor(width * 0.65);
+    const toX = first ? Math.ceil(width * 0.35) : width;
+    const fromY = first ? 0 : Math.floor(height * 0.65);
+    const toY = first ? Math.ceil(height * 0.35) : height;
+    let count = 0;
+    let totalX = 0;
+    let totalY = 0;
+    let minX = width;
+    let minY = height;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = fromY; y < toY; y += 1) {
+      for (let x = fromX; x < toX; x += 1) {
+        const offset = (y * width + x) * 4;
+        const [red, green, blue] = [data[offset], data[offset + 1], data[offset + 2]];
+        const matches = first
+          ? red > 190 && green < 75 && blue > 190
+          : red < 75 && green > 190 && blue > 190;
+        if (!matches) continue;
+        count += 1;
+        totalX += x + 0.5;
+        totalY += y + 0.5;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      }
+    }
+    if (count < 16) throw new Error("无法校准录屏位置：校准点不可见");
+    return {
+      x: totalX / count,
+      y: totalY / count,
+      width: maxX - minX + 1,
+      height: maxY - minY + 1,
+      coverage: count / ((maxX - minX + 1) * (maxY - minY + 1))
+    };
+  }
+  const first = locate("first");
+  const second = locate("second");
+  const scaleX = (second.x - first.x) / (markers.second.x - markers.first.x);
+  const scaleY = (second.y - first.y) / (markers.second.y - markers.first.y);
+  if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0) {
+    throw new Error("无法校准录屏位置：坐标无效");
+  }
+  for (const marker of [first, second]) {
+    const widthRatio = marker.width / (24 * scaleX);
+    const heightRatio = marker.height / (24 * scaleY);
+    if (widthRatio < 0.8 || widthRatio > 1.2 || heightRatio < 0.8 || heightRatio > 1.2 || marker.coverage < 0.8) {
+      throw new Error("无法校准录屏位置：校准点被遮挡或混入页面颜色");
+    }
+  }
+  return { scaleX, scaleY, offsetX: first.x - markers.first.x * scaleX, offsetY: first.y - markers.first.y * scaleY, width, height };
+}
+
+function mapVideoRectToStream(rect, calibration) {
+  if (!rect || ![rect.left, rect.top, rect.width, rect.height].every(Number.isFinite) || rect.width <= 0 || rect.height <= 0) {
+    throw new Error("录屏区域无效，请重新选择帖子");
+  }
+  const x = Math.round(calibration.offsetX + rect.left * calibration.scaleX);
+  const y = Math.round(calibration.offsetY + rect.top * calibration.scaleY);
+  const right = Math.round(calibration.offsetX + (rect.left + rect.width) * calibration.scaleX);
+  const bottom = Math.round(calibration.offsetY + (rect.top + rect.height) * calibration.scaleY);
+  if (x < 0 || y < 0 || right > calibration.width || bottom > calibration.height || right <= x || bottom <= y) {
+    throw new Error("录屏区域超出画面，请重新选择帖子");
+  }
+  return { x, y, width: right - x, height: bottom - y };
+}
+
+function startRecording(videoRect) {
+  const current = recording;
+  if (!current || current.recorder.state !== "inactive" || current.drawTimer) throw new Error("录制状态异常");
+  if (!current.calibration) throw new Error("录屏尚未校准");
+  current.layout.videoRect = videoRect;
+  current.liveCrop = mapVideoRectToStream(videoRect, current.calibration);
+  drawRecordingFrame();
+  current.drawTimer = setInterval(drawRecordingFrame, 1000 / VIDEO_LIMITS.fps);
+  current.recorder.start(1000);
+  return { ok: true };
+}
+
 function createVideoComposition(capture, layout, limits, sourceWidth = capture.width) {
+  if (layout.preservePostLayout) {
+    const scale = Math.min(sourceWidth / capture.width, limits.width / capture.width, limits.height / capture.height);
+    const width = Math.max(2, Math.floor(capture.width * scale / 2) * 2);
+    const height = Math.max(2, Math.floor(capture.height * width / capture.width / 2) * 2);
+    const actualScale = width / capture.width;
+    const source = layout.documentVideoRect;
+    const x = Math.round(source.left * actualScale);
+    const y = Math.round(source.top * actualScale);
+    return {
+      preservePostLayout: true,
+      width,
+      height,
+      video: {
+        x, y,
+        width: Math.min(width - x, Math.round(source.width * actualScale)),
+        height: Math.min(height - y, Math.round(source.height * actualScale))
+      }
+    };
+  }
   const mediaTop = Math.max(0, Math.min(capture.height, layout.mediaTop ?? layout.documentVideoRect.top));
   const footerTop = Math.max(mediaTop, Math.min(capture.height, layout.footerTop ?? capture.height));
   const contentLeft = Math.max(0, Math.min(capture.width, layout.contentArea?.left ?? 0));
@@ -229,27 +356,34 @@ function createVideoComposition(capture, layout, limits, sourceWidth = capture.w
 function drawRecordingFrame() {
   const current = recording;
   if (!current) return;
+  if (current.calibration && current.tabVideo.readyState >= 2 &&
+      (current.tabVideo.videoWidth !== current.calibration.width || current.tabVideo.videoHeight !== current.calibration.height)) {
+    current.error = new Error("录屏尺寸在录制中发生变化，请重试");
+    if (current.recorder.state !== "inactive") current.recorder.stop();
+    return;
+  }
   const { base, context, capture, layout, composition } = current;
   context.fillStyle = layout.backgroundColor || "#000";
   context.fillRect(0, 0, composition.width, composition.height);
-  if (composition.top.height > 0) {
+  if (composition.preservePostLayout) {
+    context.drawImage(base, 0, 0, base.naturalWidth, base.naturalHeight,
+      0, 0, composition.width, composition.height);
+  } else if (composition.top.height > 0) {
     context.drawImage(base, 0, 0, base.naturalWidth, composition.top.sourceHeight / capture.height * base.naturalHeight,
       0, 0, composition.width, composition.top.height);
   }
   const destination = composition.video;
   if (current.tabVideo.readyState >= 2) {
-    const source = layout.videoRect;
-    const sx = source.left / layout.viewport.width * current.tabVideo.videoWidth;
-    const sy = source.top / layout.viewport.height * current.tabVideo.videoHeight;
-    const sw = source.width / layout.viewport.width * current.tabVideo.videoWidth;
-    const sh = source.height / layout.viewport.height * current.tabVideo.videoHeight;
-    context.drawImage(current.tabVideo, sx, sy, sw, sh, destination.x, destination.y, destination.width, destination.height);
+    const source = current.liveCrop;
+    context.drawImage(current.tabVideo, source.x, source.y, source.width, source.height,
+      destination.x, destination.y, destination.width, destination.height);
   } else {
     const source = layout.documentVideoRect;
     context.drawImage(base, source.left / capture.width * base.naturalWidth, source.top / capture.height * base.naturalHeight,
       source.width / capture.width * base.naturalWidth, source.height / capture.height * base.naturalHeight,
       destination.x, destination.y, destination.width, destination.height);
   }
+  if (composition.preservePostLayout) return;
   for (const thumb of composition.thumbnails) {
     const photo = thumb.source;
     const sx = photo.left / capture.width * base.naturalWidth;
@@ -273,6 +407,7 @@ function drawRecordingFrame() {
 async function finishRecording() {
   const current = recording;
   if (!current) throw new Error("视频录制任务不存在");
+  if (!current.drawTimer) throw new Error("视频录制尚未开始");
   try {
     if (current.recorder.state !== "inactive") current.recorder.stop();
     await current.stopPromise;

@@ -47,6 +47,8 @@ function createCaptureHarness({ height = 1800, quotaFailures = 0, captureError =
           return { ok: true, scrollY: message.y, viewportWidth: 800, viewportHeight: 800 };
         }
         if (message.type === 'X_SHOT_VIDEO_PLAY' && videoPlayError) return { ok: false, error: videoPlayError };
+        if (message.type === 'X_SHOT_VIDEO_MARKERS') return { ok: true, markers: { first: { x: 20, y: 20 }, second: { x: 780, y: 580 } } };
+        if (message.type === 'X_SHOT_VIDEO_READY') return { ok: true, videoRect: { left: 100, top: 100, width: 500, height: 250 } };
         return { ok: true };
       },
       async captureVisibleTab() {
@@ -114,6 +116,12 @@ test('video capture records after tab audio capture, downloads MP4, and does not
   await harness.capture();
   assert.ok(harness.events.indexOf('STREAM_ID') < harness.events.indexOf('X_SHOT_VIDEO_PLAY'));
   assert.ok(harness.events.indexOf('X_SHOT_RECORD_BEGIN') < harness.events.indexOf('X_SHOT_VIDEO_PLAY'));
+  assert.ok(harness.events.indexOf('X_SHOT_RECORD_BEGIN') < harness.events.indexOf('X_SHOT_VIDEO_READY'));
+  assert.ok(harness.events.indexOf('X_SHOT_RECORD_BEGIN') < harness.events.indexOf('X_SHOT_VIDEO_MARKERS'));
+  assert.ok(harness.events.indexOf('X_SHOT_VIDEO_MARKERS') < harness.events.indexOf('X_SHOT_RECORD_CALIBRATE'));
+  assert.ok(harness.events.indexOf('X_SHOT_RECORD_CALIBRATE') < harness.events.indexOf('X_SHOT_VIDEO_READY'));
+  assert.ok(harness.events.indexOf('X_SHOT_VIDEO_READY') < harness.events.indexOf('X_SHOT_RECORD_START'));
+  assert.ok(harness.events.indexOf('X_SHOT_RECORD_START') < harness.events.indexOf('X_SHOT_VIDEO_PLAY'));
   assert.equal(harness.events.includes('X_SHOT_RECORD_SLIDES'), false);
   assert.ok(harness.events.indexOf('X_SHOT_VIDEO_STOP') < harness.events.indexOf('X_SHOT_RECORD_FINISH'));
   assert.ok(harness.events.indexOf('DOWNLOAD') < harness.events.indexOf('SHOW_FILE'));
