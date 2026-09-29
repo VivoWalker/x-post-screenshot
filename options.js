@@ -1,6 +1,12 @@
 const shortcutElement = document.getElementById("current-shortcut");
 const statusElement = document.getElementById("shortcut-status");
 const openButton = document.getElementById("open-shortcuts");
+const hintElement = document.getElementById("shortcut-hint");
+const firefoxShortcuts = typeof chrome.commands.openShortcutSettings === "function";
+
+hintElement.textContent = firefoxShortcuts
+  ? "Firefox 会在扩展快捷键页面中保存设置。修改后返回本页即可看到新快捷键。"
+  : "Chrome 会在扩展快捷键页面中保存设置。修改后返回本页即可看到新快捷键。";
 
 async function refreshShortcut() {
   try {
@@ -21,7 +27,11 @@ async function refreshShortcut() {
 }
 
 openButton.addEventListener("click", async () => {
-  await chrome.tabs.create({ url: "chrome://extensions/shortcuts" });
+  if (firefoxShortcuts) {
+    await chrome.commands.openShortcutSettings();
+  } else {
+    await chrome.tabs.create({ url: "chrome://extensions/shortcuts" });
+  }
 });
 
 window.addEventListener("focus", refreshShortcut);
