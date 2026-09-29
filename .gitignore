@@ -1,5 +1,6 @@
 /*.test.js
 /docs/
+/.worktrees/
 /*.zip
 /*.crx
 /*.pem
