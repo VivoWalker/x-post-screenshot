@@ -2,21 +2,18 @@
   "manifest_version": 3,
   "name": "X 帖子截图",
   "version": "0.5.0",
-  "description": "用快捷键截取 X/Twitter 帖子；图片复制到剪贴板，视频录为 MP4。",
+  "description": "用快捷键截取 X/Twitter 帖子，并将完整 PNG 复制到剪贴板。",
   "permissions": [
     "activeTab",
     "clipboardWrite",
-    "downloads",
-    "offscreen",
-    "scripting",
-    "tabCapture"
+    "scripting"
   ],
   "host_permissions": [
     "https://x.com/*",
     "https://twitter.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "scripts": ["png-stitch.js", "firefox-background.js"]
   },
   "content_scripts": [
     {
@@ -44,5 +41,13 @@
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "x-post-screenshot@vivowalker.github.io",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
   }
 }
