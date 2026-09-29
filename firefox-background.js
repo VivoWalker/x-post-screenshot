@@ -2,6 +2,21 @@ const MIN_CAPTURE_INTERVAL_MS = 650;
 const QUOTA_RETRY_DELAY_MS = 1100;
 let captureInProgress = false;
 let lastCaptureCallAt = -Infinity;
+let activeCapture = null;
+
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  if (activeCapture?.windowId === windowId && activeCapture.tabId !== tabId) {
+    activeCapture.cancelled = true;
+  }
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (activeCapture?.tabId === tabId) activeCapture.cancelled = true;
+});
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (activeCapture?.tabId === tabId && (changeInfo.url || changeInfo.status === "loading")) {
+    activeCapture.cancelled = true;
+  }
+});
 
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === "start-capture") await enterSelectionMode();
@@ -41,9 +56,10 @@ async function enterSelectionMode(tab) {
 async function captureSelection(tabId, windowId, selection) {
   if (captureInProgress) throw new Error("已有截取任务正在进行");
   captureInProgress = true;
+  activeCapture = { tabId, windowId, cancelled: false };
   try {
     const prepared = await chrome.tabs.sendMessage(tabId, {
-      type: "X_SHOT_PREPARE", selection
+      type: "X_SHOT_PREPARE", selection, stillOnly: true
     });
     if (!prepared?.ok) throw new Error(prepared?.error || "无法确定截图范围");
     const capture = prepared.capture;
@@ -66,7 +82,7 @@ async function captureSelection(tabId, windowId, selection) {
       const visibleBottom = Math.min(targetBottom, position.scrollY + position.viewportHeight);
       if (visibleBottom <= nextY + 0.5) throw new Error("无法继续截取页面底部内容");
 
-      const dataUrl = await captureVisibleFrame(windowId);
+      const dataUrl = await captureVisibleFrame(windowId, tabId);
       await stitcher.addFrame(dataUrl, {
         viewportWidth: position.viewportWidth,
         viewportHeight: position.viewportHeight,
@@ -80,6 +96,7 @@ async function captureSelection(tabId, windowId, selection) {
     }
 
     const result = stitcher.finish();
+    await ensureSelectedTab(tabId, windowId);
     const copied = await chrome.tabs.sendMessage(tabId, {
       type: "X_SHOT_COPY", dataUrl: result.dataUrl
     });
@@ -92,17 +109,29 @@ async function captureSelection(tabId, windowId, selection) {
     await notify(tabId, "success", success);
   } finally {
     await chrome.tabs.sendMessage(tabId, { type: "X_SHOT_RESTORE" }).catch(() => {});
+    activeCapture = null;
     captureInProgress = false;
   }
 }
 
-async function captureVisibleFrame(windowId) {
+async function ensureSelectedTab(tabId, windowId) {
+  if (activeCapture?.cancelled) throw new Error("标签页已切换，截图已取消");
+  const [activeTab] = await chrome.tabs.query({ active: true, windowId });
+  if (activeCapture?.cancelled || activeTab?.id !== tabId) {
+    throw new Error("标签页已切换，截图已取消");
+  }
+}
+
+async function captureVisibleFrame(windowId, tabId) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const waitMs = Math.max(0, lastCaptureCallAt + MIN_CAPTURE_INTERVAL_MS - Date.now());
     if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+    await ensureSelectedTab(tabId, windowId);
     lastCaptureCallAt = Date.now();
     try {
-      return await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+      await ensureSelectedTab(tabId, windowId);
+      return dataUrl;
     } catch (error) {
       if (!/MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(error?.message || "") || attempt === 2) {
         throw error;

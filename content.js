@@ -79,6 +79,29 @@ function xShotVideoGeometryChanged(expected, current) {
   );
 }
 
+function xShotPrepareVideo(video, stillOnly) {
+  const snapshot = {
+    video, muted: video.muted, volume: video.volume,
+    time: video.currentTime, paused: video.paused
+  };
+  video.pause();
+  if (!stillOnly) video.muted = true;
+  return snapshot;
+}
+
+function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
+  video.pause();
+  video.muted = muted;
+  video.volume = volume;
+  if (stillOnly) {
+    if (!paused) {
+      try { Promise.resolve(video.play()).catch(() => {}); } catch { /* playback may be blocked */ }
+    }
+  } else {
+    try { video.currentTime = time; } catch { /* live streams may not seek */ }
+  }
+}
+
 (() => {
   if (globalThis.__xShotLoaded) return;
   globalThis.__xShotLoaded = true;
@@ -93,6 +116,7 @@ function xShotVideoGeometryChanged(expected, current) {
     originalMediaScrolls: [],
     hiddenTransient: [],
     videos: [],
+    stillCapture: false,
     recordingVideo: null,
     recordingGeometry: null,
     calibrationMarkers: [],
@@ -108,7 +132,7 @@ function xShotVideoGeometryChanged(expected, current) {
       return;
     }
     if (message?.type === "X_SHOT_PREPARE") {
-      prepareCapture(message.selection).then(sendResponse);
+      prepareCapture(message.selection, Boolean(message.stillOnly)).then(sendResponse);
       return true;
     }
     if (message?.type === "X_SHOT_SCROLL") {
@@ -230,7 +254,7 @@ function xShotVideoGeometryChanged(expected, current) {
     return { ids, selectedId, includeConversation: selectedArticles.length > 1 };
   }
 
-  async function prepareCapture(selection) {
+  async function prepareCapture(selection, stillOnly) {
     const primary = document.querySelector(PRIMARY_SELECTOR) || document;
     const all = Array.from(primary.querySelectorAll(ARTICLE_SELECTOR)).filter(isVisible);
     let targets = selection.ids
@@ -242,13 +266,10 @@ function xShotVideoGeometryChanged(expected, current) {
 
     state.originalScrollY = window.scrollY;
     state.selectedArticles = targets;
+    state.stillCapture = stillOnly;
     state.recordingVideo = targets.at(-1)?.querySelector("video") || null;
     state.videos = Array.from(new Set(targets.flatMap((article) => Array.from(article.querySelectorAll("video")))))
-      .map((video) => ({ video, muted: video.muted, volume: video.volume, time: video.currentTime, paused: video.paused }));
-    for (const { video } of state.videos) {
-      video.pause();
-      video.muted = true;
-    }
+      .map((video) => xShotPrepareVideo(video, stillOnly));
     if (state.recordingVideo) {
       let ancestor = state.recordingVideo.parentElement;
       while (ancestor && ancestor !== targets.at(-1)) {
@@ -257,7 +278,9 @@ function xShotVideoGeometryChanged(expected, current) {
         }
         ancestor = ancestor.parentElement;
       }
-      try { await seekToStart(state.recordingVideo); } catch { /* a live source may not seek */ }
+      if (!stillOnly) {
+        try { await seekToStart(state.recordingVideo); } catch { /* a live source may not seek */ }
+      }
       state.recordingVideo.scrollIntoView({ block: "center", behavior: "instant" });
     }
     targets.forEach((article) => article.classList.add("x-shot-target"));
@@ -267,9 +290,7 @@ function xShotVideoGeometryChanged(expected, current) {
     const refreshedVideo = targets.at(-1)?.querySelector("video") || null;
     if (refreshedVideo && refreshedVideo !== state.recordingVideo) {
       state.recordingVideo = refreshedVideo;
-      state.videos.push({ video: refreshedVideo, muted: refreshedVideo.muted, volume: refreshedVideo.volume, time: refreshedVideo.currentTime, paused: refreshedVideo.paused });
-      refreshedVideo.pause();
-      refreshedVideo.muted = true;
+      state.videos.push(xShotPrepareVideo(refreshedVideo, stillOnly));
     }
     if (!refreshedVideo) state.recordingVideo = null;
     await waitForImages();
@@ -329,12 +350,7 @@ function xShotVideoGeometryChanged(expected, current) {
     removeCalibrationMarkers();
     clearInterval(state.unmuteTimer);
     state.unmuteTimer = null;
-    for (const { video, muted, volume, time } of state.videos) {
-      video.pause();
-      video.muted = muted;
-      video.volume = volume;
-      try { video.currentTime = time; } catch { /* live streams may not seek */ }
-    }
+    for (const snapshot of state.videos) xShotRestoreVideo(snapshot, state.stillCapture);
     document.documentElement.classList.remove("x-shot-capturing");
     state.selectedArticles.forEach((article) => article.classList.remove("x-shot-target"));
     state.expandedMedia.forEach(({ original, scroller, gallery, scrollLeft }) => {
@@ -350,6 +366,7 @@ function xShotVideoGeometryChanged(expected, current) {
     state.originalMediaScrolls = [];
     state.hiddenTransient = [];
     state.videos = [];
+    state.stillCapture = false;
     state.recordingVideo = null;
     state.recordingGeometry = null;
   }
