@@ -69,38 +69,64 @@ function loadImage(dataUrl) {
 
 async function beginRecording({ streamId, still, capture, layout }) {
   if (recording) throw new Error("已有视频录制任务");
-  const mimeType = [
-    "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-    "video/mp4"
-  ].find((type) => MediaRecorder.isTypeSupported(type));
-  if (!mimeType) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
+  // Let Chrome select an AVC profile/level for the actual output dimensions.
+  // isTypeSupported() does not guarantee that the device encoder can start.
+  const mimeTypes = ["video/mp4", "video/mp4;codecs=avc1,mp4a.40.2"]
+    .filter((type) => MediaRecorder.isTypeSupported(type));
+  if (!mimeTypes.length) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
   const base = await loadImage(still);
-  const composition = createVideoComposition(capture, layout, VIDEO_LIMITS, base.naturalWidth);
   const canvas = document.createElement("canvas");
-  canvas.width = composition.width;
-  canvas.height = composition.height;
   const context = canvas.getContext("2d", { alpha: false });
   const tabStream = await navigator.mediaDevices.getUserMedia({
     audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } },
     video: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } }
   });
+  let drawingStream = null;
+  const tabVideo = document.createElement("video");
   try {
-    const tabVideo = document.createElement("video");
     tabVideo.muted = true;
     tabVideo.srcObject = tabStream;
     await tabVideo.play();
-    const drawingStream = canvas.captureStream(VIDEO_LIMITS.fps);
-    const combined = new MediaStream([...drawingStream.getVideoTracks(), ...tabStream.getAudioTracks()]);
+    const profiles = [
+      VIDEO_LIMITS,
+      { ...VIDEO_LIMITS, width: 720, height: 1280, videoBitsPerSecond: 4_000_000 },
+      { ...VIDEO_LIMITS, width: 480, height: 854, videoBitsPerSecond: 2_000_000 }
+    ];
+    let recorder = null;
+    let composition = null;
+    let encoderError = null;
+    for (const limits of profiles) {
+      composition = createVideoComposition(capture, layout, limits, base.naturalWidth);
+      canvas.width = composition.width;
+      canvas.height = composition.height;
+      const drawProbeFrame = () => context.drawImage(base, 0, 0, canvas.width, canvas.height);
+      drawProbeFrame();
+      drawingStream = canvas.captureStream(limits.fps);
+      const combined = new MediaStream([...drawingStream.getVideoTracks(), ...tabStream.getAudioTracks()]);
+      for (const mimeType of mimeTypes) {
+        const options = {
+          mimeType,
+          videoBitsPerSecond: limits.videoBitsPerSecond,
+          audioBitsPerSecond: limits.audioBitsPerSecond
+        };
+        try {
+          // Discard the probe recording; the exported MP4 starts only after calibration.
+          await probeMp4Encoding(combined, options, drawProbeFrame);
+          recorder = new MediaRecorder(combined, options);
+          break;
+        } catch (error) { encoderError = error; }
+      }
+      if (recorder) break;
+      drawingStream.getTracks().forEach((track) => track.stop());
+      drawingStream = null;
+    }
+    if (!recorder) {
+      throw new Error("当前浏览器无法启动 MP4 编码，已尝试降低分辨率和码率。请更新 Chrome 后重试。", { cause: encoderError });
+    }
     const chunks = [];
-    const recorder = new MediaRecorder(combined, {
-      mimeType,
-      videoBitsPerSecond: VIDEO_LIMITS.videoBitsPerSecond,
-      audioBitsPerSecond: VIDEO_LIMITS.audioBitsPerSecond
-    });
     const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
     current.stopPromise = new Promise((resolve) => {
       recorder.addEventListener("stop", resolve, { once: true });
-      recorder.addEventListener("error", resolve, { once: true });
     });
     recorder.ondataavailable = (event) => {
       if (event.data?.size) chunks.push(event.data);
@@ -114,9 +140,62 @@ async function beginRecording({ streamId, still, capture, layout }) {
     return { ok: true, width: canvas.width, height: canvas.height, hasAudioTrack: tabStream.getAudioTracks().length > 0 };
   } catch (error) {
     if (recording) abortRecording();
-    else tabStream.getTracks().forEach((track) => track.stop());
+    else {
+      drawingStream?.getTracks().forEach((track) => track.stop());
+      tabStream.getTracks().forEach((track) => track.stop());
+      tabVideo.srcObject = null;
+    }
     throw error;
   }
+}
+
+async function probeMp4Encoding(stream, options, drawFrame) {
+  const recorder = new MediaRecorder(stream, options);
+  await new Promise((resolve, reject) => {
+    let bytes = 0;
+    let error = null;
+    let settled = false;
+    const requestFrame = () => {
+      drawFrame();
+      stream.getVideoTracks().forEach((track) => track.requestFrame?.());
+    };
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearInterval(frameTimer);
+      clearTimeout(timeout);
+      clearTimeout(stopTimeout);
+      recorder.ondataavailable = recorder.onerror = recorder.onstop = null;
+      if (recorder.state !== "inactive") recorder.stop();
+      if (error || !bytes) reject(error || new Error("MP4 编码测试未产生视频数据"));
+      else resolve();
+    };
+    const frameTimer = setInterval(requestFrame, 40);
+    const timeout = setTimeout(() => {
+      // Some MP4 muxers emit their first bytes only when stopped/flushed.
+      if (recorder.state !== "inactive") recorder.stop();
+    }, 2500);
+    const stopTimeout = setTimeout(() => {
+      error ||= new Error("MP4 编码器未能正常停止");
+      finish();
+    }, 3000);
+    recorder.ondataavailable = (event) => {
+      bytes += event.data?.size || 0;
+      if (bytes && recorder.state !== "inactive") recorder.stop();
+    };
+    recorder.onerror = (event) => {
+      error = event.error || new Error("MP4 编码测试失败");
+      if (recorder.state !== "inactive") recorder.stop();
+    };
+    recorder.onstop = finish;
+    try {
+      recorder.start(100);
+      requestFrame();
+    } catch (startError) {
+      error = startError;
+      finish();
+    }
+  });
 }
 
 async function calibrateRecording(markers) {
@@ -369,3 +448,4 @@ function abortRecording() {
   recording.tabVideo.srcObject = null;
   recording = null;
 }
+
