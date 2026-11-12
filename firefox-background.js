@@ -1,4 +1,4 @@
-const MIN_CAPTURE_INTERVAL_MS = 650;
+const MIN_CAPTURE_INTERVAL_MS = 550;
 const QUOTA_RETRY_DELAY_MS = 1100;
 let captureInProgress = false;
 let lastCaptureCallAt = -Infinity;
@@ -68,16 +68,20 @@ async function captureSelection(tabId, windowId, selection) {
     const targetBottom = capture.top + capture.height;
     let nextY = capture.top;
     let frameCount = 0;
+    let currentScrollY = capture.scrollY;
 
     while (nextY < targetBottom - 0.5) {
       const topInset = Math.min(96, capture.viewportHeight * 0.15);
-      const desiredScrollY = Math.max(0, Math.min(
+      const fitsCurrentViewport = nextY >= currentScrollY + topInset &&
+        targetBottom <= currentScrollY + capture.viewportHeight;
+      const desiredScrollY = fitsCurrentViewport ? currentScrollY : Math.max(0, Math.min(
         nextY - topInset, capture.documentHeight - capture.viewportHeight
       ));
       const position = await chrome.tabs.sendMessage(tabId, {
         type: "X_SHOT_SCROLL", y: desiredScrollY
       });
       if (!position?.ok) throw new Error("页面滚动失败");
+      currentScrollY = position.scrollY;
       const visibleTop = Math.max(capture.top, position.scrollY);
       const visibleBottom = Math.min(targetBottom, position.scrollY + position.viewportHeight);
       if (visibleBottom <= nextY + 0.5) throw new Error("无法继续截取页面底部内容");

@@ -1,5 +1,6 @@
 const CAPTURE_MESSAGE = "X_SHOT_CAPTURE";
-const MIN_CAPTURE_INTERVAL_MS = 650;
+// Chrome allows two captures per second; leave a small scheduling margin.
+const MIN_CAPTURE_INTERVAL_MS = 550;
 const QUOTA_RETRY_DELAY_MS = 1100;
 let captureInProgress = false;
 let lastCaptureCallAt = -Infinity;
@@ -68,11 +69,14 @@ async function captureSelection(tabId, windowId, selection) {
     const targetBottom = capture.top + capture.height;
     let nextY = capture.top;
     let frameCount = 0;
+    let currentScrollY = capture.scrollY;
 
     while (nextY < targetBottom - 0.5) {
       // Leave the next uncaptured row below X's sticky navigation area.
       const topInset = Math.min(96, capture.viewportHeight * 0.15);
-      const desiredScrollY = Math.max(
+      const fitsCurrentViewport = nextY >= currentScrollY + topInset &&
+        targetBottom <= currentScrollY + capture.viewportHeight;
+      const desiredScrollY = fitsCurrentViewport ? currentScrollY : Math.max(
         0,
         Math.min(nextY - topInset, capture.documentHeight - capture.viewportHeight)
       );
@@ -81,6 +85,7 @@ async function captureSelection(tabId, windowId, selection) {
         y: desiredScrollY
       });
       if (!position?.ok) throw new Error("页面滚动失败");
+      currentScrollY = position.scrollY;
 
       const visibleTop = Math.max(capture.top, position.scrollY);
       const visibleBottom = Math.min(targetBottom, position.scrollY + position.viewportHeight);

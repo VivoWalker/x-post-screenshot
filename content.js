@@ -293,7 +293,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
       state.videos.push(xShotPrepareVideo(refreshedVideo, stillOnly));
     }
     if (!refreshedVideo) state.recordingVideo = null;
-    await waitForImages();
+    // Eager images can still determine the full post height before capture.
+    await waitForImages(false);
     await animationFrames(2);
 
     const rects = targets.map((article) => article.getBoundingClientRect());
@@ -312,6 +313,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
         top,
         width: right - left,
         height: bottom - top,
+        scrollY: window.scrollY,
         viewportWidth: window.innerWidth,
         viewportHeight: window.innerHeight,
         documentHeight: document.documentElement.scrollHeight
@@ -320,10 +322,17 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
   }
 
   async function scrollAndSettle(y) {
+    const previousScrollY = window.scrollY;
     window.scrollTo({ top: y, behavior: "instant" });
     await animationFrames(2);
-    await waitForImages();
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    // Image loading and X's scroll rendering can settle at the same time.
+    // An unchanged viewport only needs the paint frames, without a scroll delay.
+    await Promise.all([
+      waitForImages(),
+      Math.abs(window.scrollY - previousScrollY) > 0.5
+        ? new Promise((resolve) => setTimeout(resolve, 120))
+        : Promise.resolve()
+    ]);
     // X may recreate its blue "new posts" pill after any scroll.
     hideTransientUi();
     await animationFrames(1);
@@ -681,17 +690,33 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     return rect.width > 0 && rect.height > 0;
   }
 
-  function waitForImages() {
-    const images = state.selectedArticles.flatMap((article) => Array.from(article.querySelectorAll("img")));
+  function waitForImages(visibleOnly = true) {
+    // Wait for offscreen lazy images when their segment enters the viewport.
+    // Eager images also settle layout during preparation; hidden gallery
+    // originals never contribute to either the layout or the current frame.
+    const images = state.selectedArticles.flatMap((article) => Array.from(article.querySelectorAll("img")))
+      .filter((image) => {
+        const rect = image.getBoundingClientRect();
+        if (!image.getClientRects().length) return false;
+        if (!visibleOnly && image.loading !== "lazy") return true;
+        return rect.bottom >= 0 && rect.top < window.innerHeight &&
+          rect.right >= 0 && rect.left < window.innerWidth;
+      });
     return waitForImageElements(images, 1500);
   }
 
   function waitForImageElements(images, timeout) {
     const pending = images.filter((image) => !image.complete).map((image) => new Promise((resolve) => {
-      const done = () => resolve();
+      const done = () => {
+        clearTimeout(timer);
+        image.removeEventListener("load", done);
+        image.removeEventListener("error", done);
+        resolve();
+      };
+      const timer = setTimeout(done, timeout);
       image.addEventListener("load", done, { once: true });
       image.addEventListener("error", done, { once: true });
-      setTimeout(done, timeout);
+      if (image.complete) done();
     }));
     return Promise.all(pending);
   }
