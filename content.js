@@ -131,7 +131,12 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
   const PRIMARY_SELECTOR = '[data-testid="primaryColumn"]';
   const state = {
     selecting: false,
-    hovered: null,
+    pointer: null,
+    hoverBox: null,
+    selectionObserver: null,
+    selectionFrame: 0,
+    multiSelect: false,
+    picks: new Map(),
     selectedArticles: [],
     expandedMedia: [],
     originalMediaScrolls: [],
@@ -193,32 +198,118 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     }
     state.selecting = true;
     document.documentElement.classList.add("x-shot-selecting");
+    state.hoverBox = makeSelectionBox("x-shot-hover-box");
+    state.selectionObserver = new MutationObserver(scheduleSelectionPaint);
+    state.selectionObserver.observe(document.body, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ["style", "class", "href"] });
+    window.addEventListener("scroll", scheduleSelectionPaint, true);
+    window.addEventListener("resize", scheduleSelectionPaint);
+    window.addEventListener("pagehide", exitSelection);
+    document.addEventListener("mouseleave", onMouseLeave);
     document.addEventListener("mousemove", onMouseMove, true);
     document.addEventListener("click", onClick, true);
     document.addEventListener("keydown", onKeyDown, true);
-    showToast("移动鼠标选择帖子，单击截图；Esc 取消", "info");
+    showToast("单击截图 · Shift + 单击多选 · Esc 取消", "selection");
   }
 
   function exitSelection() {
     state.selecting = false;
-    state.hovered?.classList.remove("x-shot-hovered");
-    state.hovered = null;
+    state.selectionObserver.disconnect();
+    cancelAnimationFrame(state.selectionFrame);
+    state.selectionFrame = 0;
+    state.pointer = null;
+    state.hoverBox.remove();
+    for (const pick of state.picks.values()) pick.box.remove();
+    state.picks.clear();
+    state.multiSelect = false;
+    window.removeEventListener("scroll", scheduleSelectionPaint, true);
+    window.removeEventListener("resize", scheduleSelectionPaint);
+    window.removeEventListener("pagehide", exitSelection);
+    document.removeEventListener("mouseleave", onMouseLeave);
+    document.getElementById("x-shot-toast")?.classList.remove("visible");
     document.documentElement.classList.remove("x-shot-selecting");
     document.removeEventListener("mousemove", onMouseMove, true);
     document.removeEventListener("click", onClick, true);
     document.removeEventListener("keydown", onKeyDown, true);
   }
 
+  function articleAtPoint(x, y) {
+    const target = document.elementFromPoint(x, y);
+    let article = target?.closest(ARTICLE_SELECTOR);
+    // Timeline cells can have a hit surface beside (rather than inside) their article.
+    if (!article) {
+      const cell = target?.closest('[data-testid="cellInnerDiv"]');
+      article = cell?.querySelector(ARTICLE_SELECTOR);
+      const rect = article?.getBoundingClientRect();
+      if (!rect || x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) return null;
+    }
+    while (article.parentElement?.closest("article")) article = article.parentElement.closest("article");
+    return article;
+  }
+
+  function makeSelectionBox(className) {
+    const box = document.createElement("div");
+    box.className = "x-shot-selection-box " + className;
+    box.setAttribute("aria-hidden", "true");
+    box.hidden = true;
+    document.documentElement.append(box);
+    return box;
+  }
+
+  function positionBox(box, article) {
+    box.hidden = !article;
+    if (!article) return;
+    const rect = article.getBoundingClientRect();
+    Object.assign(box.style, { left: rect.left + "px", top: rect.top + "px",
+      width: rect.width + "px", height: rect.height + "px" });
+  }
+
+  function refreshPicks() {
+    let articles;
+    for (const [key, pick] of state.picks) {
+      if (!pick.article?.isConnected || (typeof key === "string" && getStatusId(pick.article) !== key)) {
+        articles ??= Array.from(document.querySelectorAll(ARTICLE_SELECTOR)).filter(isVisible);
+        pick.article = typeof key === "string" ? articles.find((article) => getStatusId(article) === key) : null;
+      }
+      positionBox(pick.box, pick.article);
+    }
+  }
+
+  function scheduleSelectionPaint() {
+    if (!state.selecting || state.selectionFrame) return;
+    state.selectionFrame = requestAnimationFrame(() => {
+      state.selectionFrame = 0;
+      refreshPicks();
+      positionBox(state.hoverBox, state.pointer && articleAtPoint(state.pointer.x, state.pointer.y));
+    });
+  }
+
   function onMouseMove(event) {
-    let article = event.target.closest?.(ARTICLE_SELECTOR);
-    while (article?.parentElement.closest("article")) article = article.parentElement.closest("article");
-    if (article === state.hovered) return;
-    state.hovered?.classList.remove("x-shot-hovered");
-    state.hovered = article || null;
-    state.hovered?.classList.add("x-shot-hovered");
+    state.pointer = { x: event.clientX, y: event.clientY };
+    scheduleSelectionPaint();
+  }
+
+  function onMouseLeave() {
+    state.pointer = null;
+    scheduleSelectionPaint();
   }
 
   function onKeyDown(event) {
+    if (event.key === "Enter" && state.multiSelect) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!state.picks.size || event.repeat) return;
+      refreshPicks();
+      const targets = Array.from(state.picks.values(), (pick) => pick.article);
+      if (targets.some((article) => !article)) {
+        showToast("所选帖子已离开页面，请滚回原帖或按 Esc 重新选择", "selection");
+        return;
+      }
+      targets.sort((a, b) => a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
+      state.selectedArticles = targets;
+      startCapture({ ids: targets.map(getStatusId), multi: true });
+      return;
+    }
     if (event.key !== "Escape") return;
     event.preventDefault();
     if (state.job) cancelPageJob();
@@ -227,11 +318,30 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
   }
 
   function onClick(event) {
-    if (!state.hovered) return;
+    const article = articleAtPoint(event.clientX, event.clientY);
+    if (!article) return;
     event.preventDefault();
     event.stopImmediatePropagation();
 
-    const selection = describeSelection(state.hovered);
+    if (state.multiSelect || event.shiftKey) {
+      state.multiSelect = true;
+      const key = getStatusId(article) || article;
+      const pick = state.picks.get(key);
+      if (pick) {
+        pick.box.remove();
+        state.picks.delete(key);
+      } else {
+        const box = makeSelectionBox("x-shot-picked-box");
+        positionBox(box, article);
+        state.picks.set(key, { article, box });
+      }
+      showToast(`已选 ${state.picks.size} 条 · 单击切换 · Enter 截图 · Esc 取消`, "selection");
+      return;
+    }
+    startCapture(describeSelection(article));
+  }
+
+  function startCapture(selection) {
     exitSelection();
     showToast("正在准备帖子内容…", "progress");
     const job = { id: crypto.randomUUID(), controller: new AbortController() };
@@ -287,7 +397,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
   }
 
   async function prepareCapture(selection, stillOnly, signal) {
-    const primary = document.querySelector(PRIMARY_SELECTOR) || document;
+    stillOnly ||= selection.multi;
+    const primary = selection.multi ? document : document.querySelector(PRIMARY_SELECTOR) || document;
     const all = Array.from(primary.querySelectorAll(ARTICLE_SELECTOR)).filter(isVisible);
     const targets = selection.ids.map((id, i) => {
       const original = state.selectedArticles[i];
@@ -300,7 +411,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
 
     state.originalScroll = { top: window.scrollY, left: window.scrollX };
     state.selectedArticles = targets;
-    state.recordingVideo = targets.at(-1)?.querySelector("video") || null;
+    state.recordingVideo = selection.multi ? null : targets.at(-1)?.querySelector("video") || null;
     state.videos = Array.from(new Set(targets.flatMap((article) => Array.from(article.querySelectorAll("video")))))
       .map((video) => xShotPrepareVideo(video, stillOnly));
     if (state.recordingVideo) {
@@ -322,7 +433,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     hideTransientUi();
     await expandScrollableMedia(targets, signal);
     signal.throwIfAborted();
-    const refreshedVideo = targets.at(-1)?.querySelector("video") || null;
+    const refreshedVideo = selection.multi ? null : targets.at(-1)?.querySelector("video") || null;
     if (refreshedVideo && refreshedVideo !== state.recordingVideo) {
       state.recordingVideo = refreshedVideo;
       state.videos.push(xShotPrepareVideo(refreshedVideo, stillOnly));
@@ -333,6 +444,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     await animationFrames(2, signal);
     signal.throwIfAborted();
 
+    if (selection.multi) state.job.multiIds = selection.ids;
     state.bounds = captureBounds();
     return { ok: true, hasVideo: Boolean(state.recordingVideo), capture: {
       ...state.bounds, scrollY: window.scrollY, viewportWidth: innerWidth,
@@ -343,8 +455,18 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
   function captureBounds() {
     const targets = state.selectedArticles;
     if (targets.some((article) => !article.isConnected)) throw new Error("所选帖子已经变化，请重试");
+    if (!state.job.multiIds) return measureBounds(targets, state.expandedMedia);
+    const regions = targets.map((article, index) => {
+      if (getStatusId(article) !== state.job.multiIds[index]) throw new Error("所选帖子已经变化，请重试");
+      return measureBounds([article], state.expandedMedia.filter(({ gallery }) => article.contains(gallery)));
+    });
+    return { top: 0, left: 0, width: Math.max(...regions.map((region) => region.width)),
+      height: regions.reduce((sum, region) => sum + region.height, 0), regions };
+  }
+
+  function measureBounds(targets, galleries) {
     const rects = targets.map((article) => article.getBoundingClientRect());
-    const all = rects.concat(state.expandedMedia.map(({ gallery }) => gallery.getBoundingClientRect()));
+    const all = rects.concat(galleries.map(({ gallery }) => gallery.getBoundingClientRect()));
     const top = Math.min(...all.map((rect) => rect.top));
     const bottom = Math.max(...all.map((rect) => rect.bottom));
     const left = Math.min(...rects.map((rect) => rect.left));
@@ -357,9 +479,11 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
 
   function verifyPosition(position) {
     const bounds = captureBounds();
+    const changed = (current, expected) => ["left", "top", "width", "height"].some(
+      (key) => Math.abs(current[key] - expected[key]) > 0.5);
     if (position.scrollY !== scrollY || position.viewportWidth !== innerWidth ||
         position.viewportHeight !== innerHeight ||
-        Object.keys(bounds).some((key) => Math.abs(bounds[key] - state.bounds[key]) > 0.5)) {
+        changed(bounds, state.bounds) || bounds.regions?.some((r, i) => changed(r, state.bounds.regions[i]))) {
       throw new Error("截图期间页面布局发生变化，请重试");
     }
     return { ok: true };
@@ -853,7 +977,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     toast.textContent = text;
     toast.classList.add("visible");
     clearTimeout(state.toastTimer);
-    if (kind !== "progress") {
+    if (kind !== "progress" && kind !== "selection") {
       state.toastTimer = setTimeout(
         () => toast.classList.remove("visible"),
         kind === "error" ? 12000 : 2600

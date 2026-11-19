@@ -12,12 +12,18 @@ html.x-shot-selecting::after {
   background: rgba(0, 0, 0, 0.12);
 }
 
-article.x-shot-hovered {
-  position: relative !important;
+.x-shot-selection-box {
+  position: fixed !important;
+  pointer-events: none !important;
+  box-sizing: border-box !important;
   z-index: 2147483646 !important;
-  outline: 3px solid #1d9bf0 !important;
-  outline-offset: -3px !important;
-  background: Canvas !important;
+  border: 3px solid #1d9bf0 !important;
+}
+
+.x-shot-picked-box {
+  border: 3px dashed #10b981 !important;
+  background: rgba(16, 185, 129, 0.12) !important;
+  z-index: 2147483647 !important;
 }
 
 #x-shot-toast {
