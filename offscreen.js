@@ -1,5 +1,6 @@
 let jobId = null;
 let heartbeat = null;
+let jobController = null;
 let videoBase = null;
 const pngStitcher = new XShotPngStitcher();
 let recording = null;
@@ -17,6 +18,7 @@ async function handleMessage(message) {
   if (message.type === "X_SHOT_BEGIN") {
     if (jobId || !message.jobId) throw new Error("截图任务冲突");
     jobId = message.jobId;
+    jobController = new AbortController();
     heartbeat = setInterval(async () => {
       try {
         const status = await chrome.runtime.sendMessage({ type: "X_SHOT_ALIVE", jobId });
@@ -40,6 +42,8 @@ async function handleMessage(message) {
 function dispose() {
   clearInterval(heartbeat);
   jobId = null;
+  jobController?.abort();
+  jobController = null;
   abortRecording();
   pngStitcher.abort();
   if (videoBase) videoBase.width = videoBase.height = 0;
@@ -71,7 +75,7 @@ async function beginRecording({ streamId, capture, layout }) {
     .filter((type) => MediaRecorder.isTypeSupported(type));
   if (!mimeTypes.length) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
   const base = videoBase;
-  const owner = jobId;
+  const signal = jobController.signal;
   if (!base) throw new Error("缺少录制底图");
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d", { alpha: false });
@@ -81,8 +85,15 @@ async function beginRecording({ streamId, capture, layout }) {
   });
   let drawingStream = null;
   const tabVideo = document.createElement("video");
+  const releaseSetup = () => {
+    drawingStream?.getTracks().forEach((track) => track.stop());
+    tabStream.getTracks().forEach((track) => track.stop());
+    tabVideo.srcObject = null;
+    canvas.width = canvas.height = 0;
+  };
+  signal.addEventListener("abort", releaseSetup, { once: true });
   try {
-    if (!owner || jobId !== owner) throw new Error("录制已取消");
+    signal.throwIfAborted();
     tabVideo.muted = true;
     tabVideo.srcObject = tabStream;
     await tabVideo.play();
@@ -111,10 +122,13 @@ async function beginRecording({ streamId, capture, layout }) {
         };
         try {
           // Discard the probe recording; the exported MP4 starts only after calibration.
-          await probeMp4Encoding(combined, options, drawProbeFrame);
+          await probeMp4Encoding(combined, options, drawProbeFrame, signal);
           recorder = new MediaRecorder(combined, options);
           break;
-        } catch (error) { encoderError = error; }
+        } catch (error) {
+          signal.throwIfAborted();
+          encoderError = error;
+        }
       }
       if (recorder) break;
       drawingStream.getTracks().forEach((track) => track.stop());
@@ -123,12 +137,12 @@ async function beginRecording({ streamId, capture, layout }) {
     if (!recorder) {
       throw new Error("当前浏览器无法启动 MP4 编码，已尝试降低分辨率和码率。请更新 Chrome 后重试。", { cause: encoderError });
     }
-    if (owner !== jobId) throw new Error("录制已取消");
+    signal.throwIfAborted();
     const chunks = [];
     const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, bytes: 0, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
     current.stopPromise = new Promise((resolve) => {
       recorder.addEventListener("stop", () => {
-        if (recording === current && !current.finishing && !current.tooLarge && !current.error) {
+        if (recording === current && !current.finishing && !current.timeLimit && !current.tooLarge && !current.error) {
           failRecording(current, new Error("MP4 录制意外停止，请重试"));
         }
         resolve();
@@ -142,13 +156,10 @@ async function beginRecording({ streamId, capture, layout }) {
     recording = current;
     return { ok: true, width: canvas.width, height: canvas.height, hasAudioTrack: tabStream.getAudioTracks().length > 0 };
   } catch (error) {
-    if (recording) abortRecording();
-    else {
-      drawingStream?.getTracks().forEach((track) => track.stop());
-      tabStream.getTracks().forEach((track) => track.stop());
-      tabVideo.srcObject = null;
-    }
+    releaseSetup();
     throw error;
+  } finally {
+    signal.removeEventListener("abort", releaseSetup);
   }
 }
 
@@ -178,7 +189,8 @@ function appendChunk(current, chunk) {
   }
 }
 
-async function probeMp4Encoding(stream, options, drawFrame) {
+async function probeMp4Encoding(stream, options, drawFrame, signal) {
+  signal?.throwIfAborted();
   const recorder = new MediaRecorder(stream, options);
   await new Promise((resolve, reject) => {
     let bytes = 0;
@@ -189,7 +201,9 @@ async function probeMp4Encoding(stream, options, drawFrame) {
         stream.getVideoTracks().forEach((track) => track.requestFrame?.());
       } catch (error) { finish(error); }
     };
+    const abort = () => finish(signal.reason);
     function finish(error) {
+      signal?.removeEventListener("abort", abort);
       clearInterval(frameTimer);
       clearTimeout(sampleTimer);
       clearTimeout(flushTimer);
@@ -215,6 +229,7 @@ async function probeMp4Encoding(stream, options, drawFrame) {
     };
     recorder.onerror = (event) => finish(event.error || new Error("MP4 编码测试失败"));
     recorder.onstop = () => finish();
+    signal?.addEventListener("abort", abort, { once: true });
     try {
       recorder.start(100);
       requestFrame();
@@ -330,6 +345,13 @@ function startRecording(videoRect) {
     try { drawRecordingFrame(); } catch (error) { failRecording(current, error); }
   }, 1000 / VIDEO_LIMITS.fps);
   current.recorder.start(1000);
+  // Bound the encoder itself even when playback acknowledgement is delayed.
+  current.durationTimer = setTimeout(() => {
+    if (recording !== current || current.recorder.state === "inactive") return;
+    current.timeLimit = true;
+    current.recorder.stop();
+    chrome.runtime.sendMessage({ type: "X_SHOT_RECORD_LIMIT", jobId }).catch(() => {});
+  }, 30000);
   return { ok: true };
 }
 
@@ -469,6 +491,7 @@ function abortRecording() {
   if (!recording) return;
   const current = recording;
   recording = null;
+  clearTimeout(current.durationTimer);
   clearInterval(current.drawTimer);
   current.recorder.ondataavailable = current.recorder.onerror = null;
   try {

@@ -413,6 +413,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     window.removeEventListener("pagehide", cancelPageJob);
     document.removeEventListener("visibilitychange", onVisibilityChange);
     document.removeEventListener("keydown", onKeyDown, true);
+    const toast = document.getElementById("x-shot-toast");
+    if (toast?.dataset.kind === "progress") toast.classList.remove("visible");
     removeCalibrationMarkers();
     clearInterval(state.unmuteTimer);
     state.unmuteTimer = null;
