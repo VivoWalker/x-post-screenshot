@@ -10,7 +10,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 installCaptureController(async (job, selection) => {
   const { tabId } = job;
   const prepared = await job.page("X_SHOT_PREPARE", { selection }, 90000);
-  await job.step(ensureOffscreenDocument);
+  await ensureOffscreenDocument(job);
   const offscreen = (type, fields = {}, ms) => job.step(() =>
     chrome.runtime.sendMessage({ target: "offscreen", type, jobId: job.id, ...fields }), ms).then(requireSuccess);
   const capture = prepared.capture;
@@ -59,13 +59,16 @@ installCaptureController(async (job, selection) => {
     result.scaled ? `已缩放至 ${result.width} × ${result.height} 并复制` : "已复制到剪贴板"
   );
 }, async () => {
-  if (await bounded(chrome.offscreen.hasDocument(), 3000)) await bounded(chrome.offscreen.closeDocument(), 3000);
+  if (await bounded(hasOffscreenDocument(), 3000)) await bounded(chrome.offscreen.closeDocument(), 3000);
 });
 
 function waitForDownload(id) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const timeout = setTimeout(() => finish(new Error("MP4 下载超时")), 120000);
+    const timeout = setTimeout(() => {
+      chrome.downloads.cancel(id).catch(() => {});
+      finish(new Error("MP4 下载超时"));
+    }, 120000);
     function finish(error) {
       if (settled) return;
       settled = true;
@@ -80,18 +83,31 @@ function waitForDownload(id) {
     }
     chrome.downloads.onChanged.addListener(onChanged);
     chrome.downloads.search({ id }).then(([item]) => {
-      if (item?.state === "complete") finish();
+      if (!item) return finish(new Error("找不到 MP4 下载任务"));
+      if (item.state === "complete") finish();
       if (item?.state === "interrupted") finish(new Error("MP4 下载中断"));
     }).catch(finish);
   });
 }
 
-async function ensureOffscreenDocument() {
+async function hasOffscreenDocument() {
+  const url = chrome.runtime.getURL("offscreen.html");
+  if (chrome.runtime.getContexts) {
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"], documentUrls: [url] });
+    return contexts.length > 0;
+  }
+  const windows = await clients.matchAll({ type: "window", includeUncontrolled: true });
+  return windows.some((client) => client.url === url);
+}
+
+async function ensureOffscreenDocument(job) {
   // A previous worker may have stopped while it owned this document.
-  if (await chrome.offscreen.hasDocument()) await chrome.offscreen.closeDocument();
-  await chrome.offscreen.createDocument({
+  if (await job.step(() => hasOffscreenDocument())) {
+    await job.step(() => chrome.offscreen.closeDocument());
+  }
+  await job.step(() => chrome.offscreen.createDocument({
     url: "offscreen.html",
     reasons: ["BLOBS", "USER_MEDIA"],
     justification: "拼接帖子截图，并在用户选择视频时录制带音轨的 MP4"
-  });
+  }));
 }

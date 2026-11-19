@@ -1,5 +1,6 @@
 function getStatusId(article) {
   const ids = new Set();
+  const timestamps = new Set();
   for (const link of article.querySelectorAll('a[href*="/status/"]')) {
     if (link.closest("article") !== article ||
         link.parentElement?.closest('[data-testid="quoteTweet"], [role="link"]') ||
@@ -8,9 +9,13 @@ function getStatusId(article) {
     if (!["x.com", "twitter.com", "www.x.com", "www.twitter.com"].includes(url.hostname)) continue;
     const match = url.pathname.match(/^\/[^/]+\/status\/(\d+)\/?$/);
     if (!match) continue;
-    if (link.querySelector("time")) return match[1];
+    if (link.querySelector("time")) {
+      if (link.closest('[data-testid="User-Name"]')) return match[1];
+      timestamps.add(match[1]);
+    }
     ids.add(match[1]);
   }
+  if (timestamps.size === 1) return [...timestamps][0];
   return ids.size === 1 ? [...ids][0] : null;
 }
 
@@ -131,7 +136,6 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     originalMediaScrolls: [],
     hiddenTransient: [],
     videos: [],
-    stillCapture: false,
     recordingVideo: null,
     recordingGeometry: null,
     calibrationMarkers: [],
@@ -205,7 +209,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
   }
 
   function onMouseMove(event) {
-    const article = event.target.closest?.(ARTICLE_SELECTOR);
+    let article = event.target.closest?.(ARTICLE_SELECTOR);
+    while (article?.parentElement.closest("article")) article = article.parentElement.closest("article");
     if (article === state.hovered) return;
     state.hovered?.classList.remove("x-shot-hovered");
     state.hovered = article || null;
@@ -294,7 +299,6 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
 
     state.originalScroll = { top: window.scrollY, left: window.scrollX };
     state.selectedArticles = targets;
-    state.stillCapture = stillOnly;
     state.recordingVideo = targets.at(-1)?.querySelector("video") || null;
     state.videos = Array.from(new Set(targets.flatMap((article) => Array.from(article.querySelectorAll("video")))))
       .map((video) => xShotPrepareVideo(video, stillOnly));
@@ -388,7 +392,9 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
 
   async function copyImageToClipboard(dataUrl, signal) {
     try {
-      if (!document.hasFocus()) throw new Error("X 标签页当前没有获得焦点");
+      if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+        throw new Error("当前浏览器不支持写入 PNG 剪贴板，请更新浏览器");
+      }
       const blob = await fetch(dataUrl).then((response) => response.blob());
       signal.throwIfAborted();
       if (!document.hasFocus()) throw new Error("X 标签页当前没有获得焦点");
@@ -423,11 +429,11 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     if (state.originalScroll) window.scrollTo({ ...state.originalScroll, behavior: "instant" });
     state.originalScroll = null;
     state.selectedArticles = [];
+    state.bounds = null;
     state.expandedMedia = [];
     state.originalMediaScrolls = [];
     state.hiddenTransient = [];
     state.videos = [];
-    state.stillCapture = false;
     state.recordingVideo = null;
     state.recordingGeometry = null;
   }
@@ -762,7 +768,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
 
   function isVisible(element) {
     const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return !element.parentElement.closest("article") && rect.width > 0 && rect.height > 0;
   }
 
   function waitForImages(visibleOnly, signal) {

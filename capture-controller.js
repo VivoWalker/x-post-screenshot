@@ -42,7 +42,7 @@ function installCaptureController(run, cleanup) {
   chrome.runtime.onMessage.addListener((message, sender, respond) => {
     const job = activeCapture;
     if (message?.type === "X_SHOT_ALIVE") {
-      respond({ alive: job?.id === message.jobId && !job.controller.signal.aborted });
+      respond({ alive: Boolean(job && job.id === message.jobId && !job.controller.signal.aborted) });
       return;
     }
     if (message?.type === "X_SHOT_CANCEL" && sender.tab?.id === job?.tabId && job?.id === message.jobId) {
@@ -77,6 +77,8 @@ async function captureSelection(tab, message, run, cleanup) {
   };
   activeCapture = job;
   try {
+    const origin = await job.step(() => chrome.windows.get(tab.windowId));
+    if (!origin.focused || origin.state === "minimized") throw new Error("请在当前窗口重新选择帖子");
     await ensureSelectedTab(job);
     await run(job, message.selection);
   } finally {
@@ -128,7 +130,8 @@ async function captureFrames(job, capture, addFrame) {
     const y = fits ? scrollY : Math.max(0, Math.min(next - inset, capture.documentHeight - capture.viewportHeight));
     const position = await job.page("X_SHOT_SCROLL", { y });
     scrollY = position.scrollY;
-    const end = Math.min(bottom, scrollY + position.viewportHeight);
+    const viewportBottom = scrollY + position.viewportHeight;
+    const end = bottom <= viewportBottom + 0.5 ? bottom : viewportBottom;
     if (scrollY > next + 0.5 || end <= next || position.viewportWidth !== capture.viewportWidth ||
         position.viewportHeight !== capture.viewportHeight) throw new Error("页面尺寸或滚动位置变化，请重试");
     const url = await captureVisibleFrame(job);
@@ -163,7 +166,7 @@ async function enterSelectionMode(tab) {
 }
 
 function notify(tabId, kind, text) {
-  return chrome.tabs.sendMessage(tabId, { type: "X_SHOT_NOTICE", kind, text }).catch(() => {});
+  return bounded(chrome.tabs.sendMessage(tabId, { type: "X_SHOT_NOTICE", kind, text }), 1500).catch(() => {});
 }
 
 function isSupportedUrl(url = "") {
