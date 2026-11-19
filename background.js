@@ -1,5 +1,12 @@
 importScripts("capture-controller.js");
 
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (sender.url !== chrome.runtime.getURL("offscreen.html") || !activeCapture ||
+      message?.jobId !== activeCapture.id) return;
+  if (message.type === "X_SHOT_RECORD_ERROR") cancelCapture(message.error);
+  if (message.type === "X_SHOT_RECORD_LIMIT") activeCapture.reachedLimit?.();
+});
+
 installCaptureController(async (job, selection) => {
   const { tabId } = job;
   const prepared = await job.page("X_SHOT_PREPARE", { selection }, 90000);
@@ -14,22 +21,24 @@ installCaptureController(async (job, selection) => {
     await notify(tabId, "progress", "正在准备 MP4 录制…");
     const layout = await job.page("X_SHOT_VIDEO_POSITION", { capture });
     const streamId = await job.step(() => chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }));
-    const started = await offscreen("X_SHOT_RECORD_BEGIN", { streamId,
-      capture,
-      layout }, 70000);
-    if (!started.hasAudioTrack) throw new Error("无法取得标签页音轨，已取消录制");
+    await offscreen("X_SHOT_RECORD_BEGIN", { streamId, capture, layout }, 70000);
     const markers = await job.page("X_SHOT_VIDEO_MARKERS");
     await offscreen("X_SHOT_RECORD_CALIBRATE", { markers: markers.markers });
     const ready = await job.page("X_SHOT_VIDEO_READY");
+    const limit = new Promise((resolve) => { job.reachedLimit = resolve; });
     await offscreen("X_SHOT_RECORD_START", { videoRect: ready.videoRect });
     await job.page("X_SHOT_VIDEO_PLAY");
     await notify(tabId, "progress", "正在录制视频，最长 30 秒…");
-    await job.page("X_SHOT_VIDEO_WAIT", { maxDurationMs: 30000 }, 35000);
+    await Promise.race([limit, job.page("X_SHOT_VIDEO_WAIT", { maxDurationMs: 30000 }, 35000)]);
     await job.page("X_SHOT_VIDEO_STOP");
     const recording = await offscreen("X_SHOT_RECORD_FINISH");
-    if (!recording?.ok || !recording.dataUrl) throw new Error(recording?.error || "无法完成 MP4 编码");
+    if (!recording.dataUrl) throw new Error(recording?.error || "无法完成 MP4 编码");
+    await job.page("X_SHOT_RESTORE");
     const filename = `X-Post-Video/x-post-${Date.now()}.mp4`;
-    const downloadId = await chrome.downloads.download({ url: recording.dataUrl, filename, saveAs: false, conflictAction: "uniquify" });
+    const downloadId = await job.step(() => chrome.downloads.download({
+      url: recording.dataUrl, filename, saveAs: false, conflictAction: "uniquify"
+    }));
+    recording.dataUrl = null;
     await waitForDownload(downloadId);
     let shown = true;
     try { await chrome.downloads.show(downloadId); } catch { shown = false; }

@@ -34,7 +34,6 @@ async function handleMessage(message) {
   if (message.type === "X_SHOT_RECORD_CALIBRATE") return calibrateRecording(message.markers);
   if (message.type === "X_SHOT_RECORD_START") return startRecording(message.videoRect);
   if (message.type === "X_SHOT_RECORD_FINISH") return finishRecording();
-  if (message.type === "X_SHOT_RECORD_ABORT") { abortRecording(); return { ok: true }; }
   return { ok: false, error: "未知的图片处理请求" };
 }
 
@@ -126,18 +125,20 @@ async function beginRecording({ streamId, capture, layout }) {
     }
     if (owner !== jobId) throw new Error("录制已取消");
     const chunks = [];
-    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
+    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, bytes: 0, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
     current.stopPromise = new Promise((resolve) => {
-      recorder.addEventListener("stop", resolve, { once: true });
+      recorder.addEventListener("stop", () => {
+        if (recording === current && !current.finishing && !current.tooLarge && !current.error) {
+          failRecording(current, new Error("MP4 录制意外停止，请重试"));
+        }
+        resolve();
+      }, { once: true });
     });
-    recorder.ondataavailable = (event) => {
-      if (event.data?.size) chunks.push(event.data);
-      if (chunks.reduce((sum, chunk) => sum + chunk.size, 0) > VIDEO_LIMITS.maxBytes) {
-        current.tooLarge = true;
-        if (recorder.state !== "inactive") recorder.stop();
-      }
-    };
-    recorder.onerror = (event) => { current.error = event.error || new Error("MP4 编码失败"); };
+    recorder.ondataavailable = (event) => appendChunk(current, event.data);
+    recorder.onerror = (event) => failRecording(current, event.error || new Error("MP4 编码失败，请重试"));
+    for (const track of tabStream.getTracks()) {
+      track.addEventListener("ended", () => failRecording(current, new Error("标签页录屏或音轨中断")), { once: true });
+    }
     recording = current;
     return { ok: true, width: canvas.width, height: canvas.height, hasAudioTrack: tabStream.getAudioTracks().length > 0 };
   } catch (error) {
@@ -151,52 +152,73 @@ async function beginRecording({ streamId, capture, layout }) {
   }
 }
 
+function failRecording(current, error) {
+  if (current !== recording || current.error) return;
+  current.error = error;
+  clearInterval(current.drawTimer);
+  chrome.runtime.sendMessage({ type: "X_SHOT_RECORD_ERROR", jobId,
+    error: `MP4 录制失败：${error.message || error}` }).catch(() => {});
+  if (current.recorder.state !== "inactive") current.recorder.stop();
+}
+
+function appendChunk(current, chunk) {
+  if (current !== recording || current.error || !chunk?.size) return;
+  current.bytes += chunk.size;
+  if (current.bytes > VIDEO_LIMITS.maxBytes) {
+    current.chunks.length = 0;
+    failRecording(current, new Error("MP4 编码结果超过 40 MB，请缩短视频后重试"));
+    return;
+  }
+  current.chunks.push(chunk);
+  // Reserve room for one more timeslice and the MP4 muxer's final data.
+  if (current.bytes >= VIDEO_LIMITS.maxBytes - 2_000_000 && !current.tooLarge && !current.finishing) {
+    current.tooLarge = true;
+    if (current.recorder.state !== "inactive") current.recorder.stop();
+    chrome.runtime.sendMessage({ type: "X_SHOT_RECORD_LIMIT", jobId }).catch(() => {});
+  }
+}
+
 async function probeMp4Encoding(stream, options, drawFrame) {
   const recorder = new MediaRecorder(stream, options);
   await new Promise((resolve, reject) => {
     let bytes = 0;
-    let error = null;
-    let settled = false;
+    let flushTimer;
     const requestFrame = () => {
-      drawFrame();
-      stream.getVideoTracks().forEach((track) => track.requestFrame?.());
+      try {
+        drawFrame();
+        stream.getVideoTracks().forEach((track) => track.requestFrame?.());
+      } catch (error) { finish(error); }
     };
-    const finish = () => {
-      if (settled) return;
-      settled = true;
+    function finish(error) {
       clearInterval(frameTimer);
-      clearTimeout(timeout);
-      clearTimeout(stopTimeout);
+      clearTimeout(sampleTimer);
+      clearTimeout(flushTimer);
       recorder.ondataavailable = recorder.onerror = recorder.onstop = null;
-      if (recorder.state !== "inactive") recorder.stop();
+      try {
+        if (recorder.state !== "inactive") recorder.stop();
+      } catch (stopError) { error ||= stopError; }
       if (error || !bytes) reject(error || new Error("MP4 编码测试未产生视频数据"));
       else resolve();
-    };
+    }
+    function requestStop() {
+      if (flushTimer !== undefined) return;
+      // Some encoders emit all data after stop(). Give that flush its own deadline.
+      flushTimer = setTimeout(() => finish(new Error("MP4 编码器未能正常停止")), 5000);
+      try { if (recorder.state !== "inactive") recorder.stop(); }
+      catch (error) { finish(error); }
+    }
     const frameTimer = setInterval(requestFrame, 40);
-    const timeout = setTimeout(() => {
-      // Some MP4 muxers emit their first bytes only when stopped/flushed.
-      if (recorder.state !== "inactive") recorder.stop();
-    }, 2500);
-    const stopTimeout = setTimeout(() => {
-      error ||= new Error("MP4 编码器未能正常停止");
-      finish();
-    }, 3000);
+    const sampleTimer = setTimeout(requestStop, 2500);
     recorder.ondataavailable = (event) => {
       bytes += event.data?.size || 0;
-      if (bytes && recorder.state !== "inactive") recorder.stop();
+      if (bytes) requestStop();
     };
-    recorder.onerror = (event) => {
-      error = event.error || new Error("MP4 编码测试失败");
-      if (recorder.state !== "inactive") recorder.stop();
-    };
-    recorder.onstop = finish;
+    recorder.onerror = (event) => finish(event.error || new Error("MP4 编码测试失败"));
+    recorder.onstop = () => finish();
     try {
       recorder.start(100);
       requestFrame();
-    } catch (startError) {
-      error = startError;
-      finish();
-    }
+    } catch (error) { finish(error); }
   });
 }
 
@@ -213,8 +235,8 @@ async function waitForTabCalibration(tabVideo, markers) {
   const deadline = Date.now() + 4000;
   while (Date.now() < deadline) {
     if (tabVideo.videoWidth > 0 && tabVideo.videoHeight > 0 && tabVideo.readyState >= 2) {
-      probe.width = tabVideo.videoWidth;
-      probe.height = tabVideo.videoHeight;
+      if (probe.width !== tabVideo.videoWidth) probe.width = tabVideo.videoWidth;
+      if (probe.height !== tabVideo.videoHeight) probe.height = tabVideo.videoHeight;
       probeContext.drawImage(tabVideo, 0, 0);
       try {
         return calibrateTabStream(probeContext.getImageData(0, 0, probe.width, probe.height), markers);
@@ -304,7 +326,9 @@ function startRecording(videoRect) {
   current.layout.videoRect = videoRect;
   current.liveCrop = mapVideoRectToStream(videoRect, current.calibration);
   drawRecordingFrame();
-  current.drawTimer = setInterval(drawRecordingFrame, 1000 / VIDEO_LIMITS.fps);
+  current.drawTimer = setInterval(() => {
+    try { drawRecordingFrame(); } catch (error) { failRecording(current, error); }
+  }, 1000 / VIDEO_LIMITS.fps);
   current.recorder.start(1000);
   return { ok: true };
 }
@@ -373,9 +397,7 @@ function drawRecordingFrame() {
   if (!current) return;
   if (current.calibration && current.tabVideo.readyState >= 2 &&
       (current.tabVideo.videoWidth !== current.calibration.width || current.tabVideo.videoHeight !== current.calibration.height)) {
-    current.error = new Error("录屏尺寸在录制中发生变化，请重试");
-    if (current.recorder.state !== "inactive") current.recorder.stop();
-    return;
+    throw new Error("录屏尺寸在录制中发生变化，请重试");
   }
   const { base, context, capture, layout, composition } = current;
   context.fillStyle = layout.backgroundColor || "#000";
@@ -424,10 +446,12 @@ async function finishRecording() {
   if (!current) throw new Error("视频录制任务不存在");
   if (!current.drawTimer) throw new Error("视频录制尚未开始");
   try {
+    current.finishing = true;
     if (current.recorder.state !== "inactive") current.recorder.stop();
     await current.stopPromise;
     if (current.error) throw current.error;
     const blob = new Blob(current.chunks, { type: "video/mp4" });
+    abortRecording();
     if (!blob.size) throw new Error("录制结果为空");
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -435,19 +459,27 @@ async function finishRecording() {
       reader.onerror = () => reject(new Error("无法读取录制结果"));
       reader.readAsDataURL(blob);
     });
-    return { ok: true, dataUrl, bytes: blob.size, truncated: current.tooLarge, width: current.canvas.width, height: current.canvas.height };
+    return { ok: true, dataUrl, bytes: blob.size, truncated: current.tooLarge };
   } finally {
-    abortRecording();
+    if (recording === current) abortRecording();
   }
 }
 
 function abortRecording() {
   if (!recording) return;
-  clearInterval(recording.drawTimer);
-  if (recording.recorder.state !== "inactive") recording.recorder.stop();
-  recording.drawingStream.getTracks().forEach((track) => track.stop());
-  recording.tabStream.getTracks().forEach((track) => track.stop());
-  recording.tabVideo.srcObject = null;
+  const current = recording;
   recording = null;
+  clearInterval(current.drawTimer);
+  current.recorder.ondataavailable = current.recorder.onerror = null;
+  try {
+    if (current.recorder.state !== "inactive") current.recorder.stop();
+  } finally {
+    current.drawingStream.getTracks().forEach((track) => track.stop());
+    current.tabStream.getTracks().forEach((track) => track.stop());
+    current.tabVideo.srcObject = null;
+    current.chunks.length = 0;
+    current.canvas.width = current.canvas.height = 0;
+    current.base.width = current.base.height = 0;
+    videoBase = null;
+  }
 }
-

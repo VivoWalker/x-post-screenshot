@@ -307,7 +307,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
         ancestor = ancestor.parentElement;
       }
       if (!stillOnly) {
-        try { await seekToStart(state.recordingVideo); } catch { /* a live source may not seek */ }
+        try { await seekToStart(state.recordingVideo, signal); } catch { /* a live source may not seek */ }
       }
       signal.throwIfAborted();
       state.recordingVideo.scrollIntoView({ block: "center", behavior: "instant" });
@@ -437,7 +437,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     if (!video || !document.contains(video)) return { ok: false, error: "所选视频已离开页面" };
     video.pause();
     video.muted = true;
-    try { await seekToStart(video); } catch { return { ok: false, error: "该视频不支持从开头播放" }; }
+    try { await seekToStart(video, signal); } catch { return { ok: false, error: "该视频不支持从开头播放" }; }
     signal.throwIfAborted();
     video.scrollIntoView({ block: "center", behavior: "instant" });
     await animationFrames(2, signal);
@@ -559,7 +559,17 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
       const done = () => finish({ ok: true });
       const abort = () => finish({ ok: false, error: "录制已取消" });
       signal.addEventListener("abort", abort, { once: true });
+      let lastTime = video.currentTime;
+      let lastProgress = performance.now();
       const check = () => {
+        if (video.ended) return done();
+        if (video.error || video.paused || video.seeking) return finish({ ok: false, error: "视频播放中断，请重试" });
+        if (video.currentTime !== lastTime) {
+          lastTime = video.currentTime;
+          lastProgress = performance.now();
+        } else if (performance.now() - lastProgress > 3000) {
+          return finish({ ok: false, error: "视频缓冲时间过长，请等待加载后重试" });
+        }
         if (!document.contains(video)) return finish({ ok: false, error: "视频在录制中离开页面" });
         const rect = video.getBoundingClientRect();
         const current = { left: rect.left, top: rect.top, width: rect.width, height: rect.height,
@@ -581,12 +591,19 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     return result;
   }
 
-  function seekToStart(video) {
+  function seekToStart(video, signal) {
     video.currentTime = 0;
-    if (!video.seeking) return Promise.resolve();
-    return new Promise((resolve) => {
-      const done = () => { clearTimeout(timer); video.removeEventListener("seeked", done); resolve(); };
+    if (!video.seeking && video.currentTime <= 0.1) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const done = () => {
+        clearTimeout(timer);
+        video.removeEventListener("seeked", done);
+        signal.removeEventListener("abort", done);
+        if (signal.aborted || video.seeking || video.currentTime > 0.1) reject(new Error("视频定位失败"));
+        else resolve();
+      };
       const timer = setTimeout(done, 1500);
+      signal.addEventListener("abort", done, { once: true });
       video.addEventListener("seeked", done, { once: true });
     });
   }
