@@ -1,3 +1,24 @@
+function getStatusId(article) {
+  const ids = new Set();
+  const timestamps = new Set();
+  for (const link of article.querySelectorAll('a[href*="/status/"]')) {
+    if (link.closest("article") !== article ||
+        link.parentElement?.closest('[data-testid="quoteTweet"], [role="link"]') ||
+        link.closest('[data-testid="tweetText"]')) continue;
+    const url = new URL(link.href, location.href);
+    if (!["x.com", "twitter.com", "www.x.com", "www.twitter.com"].includes(url.hostname)) continue;
+    const match = url.pathname.match(/^\/[^/]+\/status\/(\d+)\/?$/);
+    if (!match) continue;
+    if (link.querySelector("time")) {
+      if (link.closest('[data-testid="User-Name"]')) return match[1];
+      timestamps.add(match[1]);
+    }
+    ids.add(match[1]);
+  }
+  if (timestamps.size === 1) return [...timestamps][0];
+  return ids.size === 1 ? [...ids][0] : null;
+}
+
 function xShotFooterTop(article, mediaBottom, scrollY, captureTop) {
   const actionTops = Array.from(article?.querySelectorAll('[data-testid="reply"]') || [])
     .map((button) => button.closest('[role="group"]'))
@@ -8,8 +29,7 @@ function xShotFooterTop(article, mediaBottom, scrollY, captureTop) {
 }
 
 function xShotVideoMediaSources(article, video, expandedMedia) {
-  const mainLink = article?.querySelector('time')?.closest('a[href*="/status/"]');
-  const mainStatusId = mainLink?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1];
+  const mainStatusId = article && getStatusId(article);
   const quoteCards = new Set();
   let preservePostLayout = (article?.querySelectorAll('[data-testid="tweetText"]')?.length || 0) > 1;
   if (mainStatusId) {
@@ -82,29 +102,30 @@ function xShotVideoGeometryChanged(expected, current) {
 function xShotPrepareVideo(video, stillOnly) {
   const snapshot = {
     video, muted: video.muted, volume: video.volume,
-    time: video.currentTime, paused: video.paused
+    time: video.currentTime, paused: video.paused, loop: video.loop
   };
   video.pause();
   if (!stillOnly) video.muted = true;
   return snapshot;
 }
 
-function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
+function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
   video.pause();
   video.muted = muted;
   video.volume = volume;
-  if (stillOnly) {
-    if (!paused) {
-      try { Promise.resolve(video.play()).catch(() => {}); } catch { /* playback may be blocked */ }
-    }
-  } else {
-    try { video.currentTime = time; } catch { /* live streams may not seek */ }
+  video.loop = loop;
+  if (Number.isFinite(time) && video.currentTime !== time) {
+    try { video.currentTime = time; } catch { /* Some live sources cannot seek. */ }
+  }
+  if (!paused && video.isConnected) {
+    try { Promise.resolve(video.play()).catch(() => {}); } catch { /* Autoplay policy. */ }
   }
 }
 
 (() => {
   if (globalThis.__xShotLoaded) return;
   globalThis.__xShotLoaded = true;
+  const runtime = (globalThis.browser ?? chrome).runtime;
 
   const ARTICLE_SELECTOR = 'article[data-testid="tweet"], article';
   const PRIMARY_SELECTOR = '[data-testid="primaryColumn"]';
@@ -116,62 +137,47 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     originalMediaScrolls: [],
     hiddenTransient: [],
     videos: [],
-    stillCapture: false,
     recordingVideo: null,
     recordingGeometry: null,
     calibrationMarkers: [],
     unmuteTimer: null,
-    originalScrollY: 0,
+    job: null,
+    originalScroll: null,
     toastTimer: null
   };
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "X_SHOT_ENTER") {
       enterSelection();
       sendResponse({ ok: true });
       return;
     }
-    if (message?.type === "X_SHOT_PREPARE") {
-      prepareCapture(message.selection, Boolean(message.stillOnly)).then(sendResponse);
+    const job = state.job;
+    if (message?.jobId) {
+      if (!job || job.id !== message.jobId || job.controller.signal.aborted) {
+        sendResponse({ ok: false, error: "截图任务已结束" });
+        return;
+      }
+      const signal = job.controller.signal;
+      const dispatch = async () => {
+        switch (message.type) {
+          case "X_SHOT_PREPARE": return prepareCapture(message.selection, Boolean(message.stillOnly), signal);
+          case "X_SHOT_SCROLL": return scrollAndSettle(message.y, signal);
+          case "X_SHOT_VERIFY": return verifyPosition(message.position);
+          case "X_SHOT_COPY": return copyImageToClipboard(message.dataUrl, signal);
+          case "X_SHOT_VIDEO_POSITION": return positionVideo(message.capture, signal);
+          case "X_SHOT_VIDEO_PLAY": return playVideo(signal);
+          case "X_SHOT_VIDEO_MARKERS": return readCalibrationMarkers();
+          case "X_SHOT_VIDEO_READY": return readyVideo(signal);
+          case "X_SHOT_VIDEO_WAIT": return waitForVideoEnd(message.maxDurationMs, signal);
+          case "X_SHOT_VIDEO_STOP": state.recordingVideo?.pause(); break;
+          case "X_SHOT_RESTORE": restorePage(job); break;
+          default: throw new Error("未知的截图请求");
+        }
+        return { ok: true };
+      };
+      dispatch().then(sendResponse, (error) => sendResponse({ ok: false, error: error.message }));
       return true;
-    }
-    if (message?.type === "X_SHOT_SCROLL") {
-      scrollAndSettle(message.y).then(sendResponse);
-      return true;
-    }
-    if (message?.type === "X_SHOT_COPY") {
-      copyImageToClipboard(message.dataUrl).then(sendResponse);
-      return true;
-    }
-    if (message?.type === "X_SHOT_VIDEO_POSITION") {
-      positionVideo(message.capture).then(sendResponse);
-      return true;
-    }
-    if (message?.type === "X_SHOT_VIDEO_PLAY") {
-      playVideo().then(sendResponse);
-      return true;
-    }
-    if (message?.type === "X_SHOT_VIDEO_MARKERS") {
-      sendResponse(readCalibrationMarkers());
-      return;
-    }
-    if (message?.type === "X_SHOT_VIDEO_READY") {
-      readyVideo().then(sendResponse);
-      return true;
-    }
-    if (message?.type === "X_SHOT_VIDEO_WAIT") {
-      waitForVideoEnd(message.maxDurationMs).then(sendResponse);
-      return true;
-    }
-    if (message?.type === "X_SHOT_VIDEO_STOP") {
-      state.recordingVideo?.pause();
-      sendResponse({ ok: true });
-      return;
-    }
-    if (message?.type === "X_SHOT_RESTORE") {
-      restorePage();
-      sendResponse({ ok: true });
-      return;
     }
     if (message?.type === "X_SHOT_NOTICE") {
       showToast(message.text, message.kind);
@@ -180,6 +186,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
   });
 
   function enterSelection() {
+    if (state.job) return;
     if (state.selecting) {
       exitSelection();
       return;
@@ -203,7 +210,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
   }
 
   function onMouseMove(event) {
-    const article = event.target.closest?.(ARTICLE_SELECTOR);
+    let article = event.target.closest?.(ARTICLE_SELECTOR);
+    while (article?.parentElement.closest("article")) article = article.parentElement.closest("article");
     if (article === state.hovered) return;
     state.hovered?.classList.remove("x-shot-hovered");
     state.hovered = article || null;
@@ -213,7 +221,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
   function onKeyDown(event) {
     if (event.key !== "Escape") return;
     event.preventDefault();
-    exitSelection();
+    if (state.job) cancelPageJob();
+    else exitSelection();
     showToast("已取消", "info");
   }
 
@@ -225,11 +234,34 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     const selection = describeSelection(state.hovered);
     exitSelection();
     showToast("正在准备帖子内容…", "progress");
-    chrome.runtime.sendMessage({ type: "X_SHOT_SELECTION", selection })
+    const job = { id: crypto.randomUUID(), controller: new AbortController() };
+    state.job = job;
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("pagehide", cancelPageJob);
+    job.heartbeat = setInterval(async () => {
+      try {
+        const result = await runtime.sendMessage({ type: "X_SHOT_ALIVE", jobId: job.id });
+        if (!result?.alive) restorePage(job);
+      } catch { restorePage(job); }
+    }, 5000);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    runtime.sendMessage({ type: "X_SHOT_SELECTION", jobId: job.id, selection })
       .then((result) => {
         if (!result?.ok) showToast(`截图失败：${result?.error || "后台没有返回结果"}`, "error");
       })
-      .catch((error) => showToast(`截图失败：${error?.message || String(error)}`, "error"));
+      .catch((error) => showToast(`截图失败：${error?.message || String(error)}`, "error"))
+      .finally(() => restorePage(job));
+  }
+
+  function onVisibilityChange() {
+    if (document.hidden) cancelPageJob();
+  }
+
+  function cancelPageJob() {
+    const job = state.job;
+    if (!job) return;
+    restorePage(job);
+    runtime.sendMessage({ type: "X_SHOT_CANCEL", jobId: job.id }).catch(() => {});
   }
 
   function describeSelection(selected) {
@@ -242,31 +274,32 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     const focalIndex = pageId ? articles.findIndex((article) => getStatusId(article) === pageId) : -1;
 
     let startIndex = selectedIndex;
-    if (selectedIndex >= 0 && selectedId === pageId && selectedIndex > 0) {
+    if (pageId && selectedId === pageId && selectedIndex > 0) {
       startIndex = 0;
     } else if (selectedIndex > focalIndex && focalIndex >= 0) {
       startIndex = focalIndex;
     }
 
     const selectedArticles = articles.slice(startIndex, selectedIndex + 1);
-    const ids = selectedArticles.map(getStatusId).filter(Boolean);
+    const ids = selectedArticles.map(getStatusId);
     state.selectedArticles = selectedArticles;
     return { ids, selectedId, includeConversation: selectedArticles.length > 1 };
   }
 
-  async function prepareCapture(selection, stillOnly) {
+  async function prepareCapture(selection, stillOnly, signal) {
     const primary = document.querySelector(PRIMARY_SELECTOR) || document;
     const all = Array.from(primary.querySelectorAll(ARTICLE_SELECTOR)).filter(isVisible);
-    let targets = selection.ids
-      .map((id) => all.find((article) => getStatusId(article) === id))
-      .filter(Boolean);
+    const targets = selection.ids.map((id, i) => {
+      const original = state.selectedArticles[i];
+      if (all.includes(original) && getStatusId(original) === id) return original;
+      return id && all.find((article) => getStatusId(article) === id);
+    });
+    if (!targets.length || targets.some((target) => !target)) {
+      throw new Error("所选帖子已经变化，请重新选择");
+    }
 
-    if (!targets.length && state.selectedArticles.length) targets = state.selectedArticles.filter(document.contains.bind(document));
-    if (!targets.length) return { ok: false, error: "所选帖子已经不在页面中" };
-
-    state.originalScrollY = window.scrollY;
+    state.originalScroll = { top: window.scrollY, left: window.scrollX };
     state.selectedArticles = targets;
-    state.stillCapture = stillOnly;
     state.recordingVideo = targets.at(-1)?.querySelector("video") || null;
     state.videos = Array.from(new Set(targets.flatMap((article) => Array.from(article.querySelectorAll("video")))))
       .map((video) => xShotPrepareVideo(video, stillOnly));
@@ -279,14 +312,16 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
         ancestor = ancestor.parentElement;
       }
       if (!stillOnly) {
-        try { await seekToStart(state.recordingVideo); } catch { /* a live source may not seek */ }
+        try { await seekToStart(state.recordingVideo, signal); } catch { /* a live source may not seek */ }
       }
+      signal.throwIfAborted();
       state.recordingVideo.scrollIntoView({ block: "center", behavior: "instant" });
     }
     targets.forEach((article) => article.classList.add("x-shot-target"));
     document.documentElement.classList.add("x-shot-capturing");
     hideTransientUi();
-    await expandScrollableMedia(targets);
+    await expandScrollableMedia(targets, signal);
+    signal.throwIfAborted();
     const refreshedVideo = targets.at(-1)?.querySelector("video") || null;
     if (refreshedVideo && refreshedVideo !== state.recordingVideo) {
       state.recordingVideo = refreshedVideo;
@@ -294,48 +329,60 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     }
     if (!refreshedVideo) state.recordingVideo = null;
     // Eager images can still determine the full post height before capture.
-    await waitForImages(false);
-    await animationFrames(2);
+    await waitForImages(false, signal);
+    await animationFrames(2, signal);
+    signal.throwIfAborted();
 
-    const rects = targets.map((article) => article.getBoundingClientRect());
-    const galleryRects = state.expandedMedia.map(({ gallery }) => gallery.getBoundingClientRect());
-    const captureRects = rects.concat(galleryRects);
-    const left = Math.min(...rects.map((rect) => rect.left));
-    const right = Math.max(...rects.map((rect) => rect.right));
-    const top = Math.min(...captureRects.map((rect) => rect.top + window.scrollY));
-    const bottom = Math.max(...captureRects.map((rect) => rect.bottom + window.scrollY));
-
-    return {
-      ok: true,
-      hasVideo: Boolean(state.recordingVideo),
-      capture: {
-        left,
-        top,
-        width: right - left,
-        height: bottom - top,
-        scrollY: window.scrollY,
-        viewportWidth: window.innerWidth,
-        viewportHeight: window.innerHeight,
-        documentHeight: document.documentElement.scrollHeight
-      }
-    };
+    state.bounds = captureBounds();
+    return { ok: true, hasVideo: Boolean(state.recordingVideo), capture: {
+      ...state.bounds, scrollY: window.scrollY, viewportWidth: innerWidth,
+      viewportHeight: innerHeight, documentHeight: document.documentElement.scrollHeight
+    } };
   }
 
-  async function scrollAndSettle(y) {
+  function captureBounds() {
+    const targets = state.selectedArticles;
+    if (targets.some((article) => !article.isConnected)) throw new Error("所选帖子已经变化，请重试");
+    const rects = targets.map((article) => article.getBoundingClientRect());
+    const all = rects.concat(state.expandedMedia.map(({ gallery }) => gallery.getBoundingClientRect()));
+    const top = Math.min(...all.map((rect) => rect.top));
+    const bottom = Math.max(...all.map((rect) => rect.bottom));
+    const left = Math.min(...rects.map((rect) => rect.left));
+    const right = Math.max(...rects.map((rect) => rect.right));
+    if (bottom <= top || right <= left || left < -0.5 || right > innerWidth + 0.5) {
+      throw new Error("帖子超出可截取范围，请调整窗口后重试");
+    }
+    return { top: top + scrollY, left, width: right - left, height: bottom - top };
+  }
+
+  function verifyPosition(position) {
+    const bounds = captureBounds();
+    if (position.scrollY !== scrollY || position.viewportWidth !== innerWidth ||
+        position.viewportHeight !== innerHeight ||
+        Object.keys(bounds).some((key) => Math.abs(bounds[key] - state.bounds[key]) > 0.5)) {
+      throw new Error("截图期间页面布局发生变化，请重试");
+    }
+    return { ok: true };
+  }
+
+  async function scrollAndSettle(y, signal) {
     const previousScrollY = window.scrollY;
     window.scrollTo({ top: y, behavior: "instant" });
-    await animationFrames(2);
+    await animationFrames(2, signal);
+    signal.throwIfAborted();
     // Image loading and X's scroll rendering can settle at the same time.
     // An unchanged viewport only needs the paint frames, without a scroll delay.
     await Promise.all([
-      waitForImages(),
+      waitForImages(true, signal),
       Math.abs(window.scrollY - previousScrollY) > 0.5
         ? new Promise((resolve) => setTimeout(resolve, 120))
         : Promise.resolve()
     ]);
+    signal.throwIfAborted();
     // X may recreate its blue "new posts" pill after any scroll.
     hideTransientUi();
-    await animationFrames(1);
+    await animationFrames(1, signal);
+    signal.throwIfAborted();
     return {
       ok: true,
       scrollY: window.scrollY,
@@ -344,10 +391,14 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     };
   }
 
-  async function copyImageToClipboard(dataUrl) {
+  async function copyImageToClipboard(dataUrl, signal) {
     try {
-      if (!document.hasFocus()) throw new Error("X 标签页当前没有获得焦点");
+      if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+        throw new Error("当前浏览器不支持写入 PNG 剪贴板，请更新浏览器");
+      }
       const blob = await fetch(dataUrl).then((response) => response.blob());
+      signal.throwIfAborted();
+      if (!document.hasFocus()) throw new Error("X 标签页当前没有获得焦点");
       await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
       return { ok: true };
     } catch (error) {
@@ -355,11 +406,20 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     }
   }
 
-  function restorePage() {
+  function restorePage(job) {
+    if (state.job !== job) return;
+    state.job = null;
+    clearInterval(job.heartbeat);
+    job.controller.abort();
+    window.removeEventListener("pagehide", cancelPageJob);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
+    document.removeEventListener("keydown", onKeyDown, true);
+    const toast = document.getElementById("x-shot-toast");
+    if (toast?.dataset.kind === "progress") toast.classList.remove("visible");
     removeCalibrationMarkers();
     clearInterval(state.unmuteTimer);
     state.unmuteTimer = null;
-    for (const snapshot of state.videos) xShotRestoreVideo(snapshot, state.stillCapture);
+    for (const snapshot of state.videos) xShotRestoreVideo(snapshot);
     document.documentElement.classList.remove("x-shot-capturing");
     state.selectedArticles.forEach((article) => article.classList.remove("x-shot-target"));
     state.expandedMedia.forEach(({ original, scroller, gallery, scrollLeft }) => {
@@ -367,30 +427,34 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
       scroller.scrollLeft = scrollLeft;
       gallery.remove();
     });
-    state.originalMediaScrolls.forEach(({ element, left }) => { element.scrollLeft = left; });
+    state.originalMediaScrolls.reverse().forEach(({ element, left }) => { element.scrollLeft = left; });
     state.hiddenTransient.forEach((element) => element.classList.remove("x-shot-transient-hidden"));
-    window.scrollTo({ top: state.originalScrollY, behavior: "instant" });
+    if (state.originalScroll) window.scrollTo({ ...state.originalScroll, behavior: "instant" });
+    state.originalScroll = null;
     state.selectedArticles = [];
+    state.bounds = null;
     state.expandedMedia = [];
     state.originalMediaScrolls = [];
     state.hiddenTransient = [];
     state.videos = [];
-    state.stillCapture = false;
     state.recordingVideo = null;
     state.recordingGeometry = null;
   }
 
-  async function positionVideo(capture) {
+  async function positionVideo(capture, signal) {
     const video = state.recordingVideo;
     if (!video || !document.contains(video)) return { ok: false, error: "所选视频已离开页面" };
     video.pause();
     video.muted = true;
-    try { await seekToStart(video); } catch { return { ok: false, error: "该视频不支持从开头播放" }; }
+    try { await seekToStart(video, signal); } catch { return { ok: false, error: "该视频不支持从开头播放" }; }
+    signal.throwIfAborted();
     video.scrollIntoView({ block: "center", behavior: "instant" });
-    await animationFrames(2);
+    await animationFrames(2, signal);
+    signal.throwIfAborted();
     hideTransientUi();
     showCalibrationMarkers();
-    await animationFrames(2);
+    await animationFrames(2, signal);
+    signal.throwIfAborted();
     const rect = video.getBoundingClientRect();
     if (rect.width < 1 || rect.height < 1 || rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
       return { ok: false, error: "视频无法完整显示在当前窗口；请扩大窗口后重试" };
@@ -451,9 +515,10 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     return { ok: true, markers: { first, second } };
   }
 
-  async function readyVideo() {
+  async function readyVideo(signal) {
     removeCalibrationMarkers();
-    await animationFrames(2);
+    await animationFrames(2, signal);
+    signal.throwIfAborted();
     const video = state.recordingVideo;
     if (!video || !document.contains(video)) return { ok: false, error: "所选视频已离开页面" };
     const rect = video.getBoundingClientRect();
@@ -465,13 +530,15 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     return { ok: true, videoRect };
   }
 
-  async function playVideo() {
+  async function playVideo(signal) {
     const video = state.recordingVideo;
     if (!video) return { ok: false, error: "视频已不存在" };
     try {
+      video.loop = false;
       video.volume = 1;
       video.muted = false;
       await video.play();
+      signal.throwIfAborted();
       clearInterval(state.unmuteTimer);
       state.unmuteTimer = setInterval(() => {
         if (!document.contains(video)) return;
@@ -484,7 +551,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     }
   }
 
-  async function waitForVideoEnd(maxDurationMs) {
+  async function waitForVideoEnd(maxDurationMs, signal) {
     const video = state.recordingVideo;
     if (!video) return { ok: false, error: "视频已不存在" };
     const boundedMs = Math.min(30000, Math.max(1000, maxDurationMs || 30000));
@@ -494,11 +561,24 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
       const finish = (value) => {
         clearTimeout(timer);
         clearInterval(monitor);
+        signal.removeEventListener("abort", abort);
         video.removeEventListener("ended", done);
         resolve(value);
       };
       const done = () => finish({ ok: true });
+      const abort = () => finish({ ok: false, error: "录制已取消" });
+      signal.addEventListener("abort", abort, { once: true });
+      let lastTime = video.currentTime;
+      let lastProgress = performance.now();
       const check = () => {
+        if (video.ended) return done();
+        if (video.error || video.paused || video.seeking) return finish({ ok: false, error: "视频播放中断，请重试" });
+        if (video.currentTime !== lastTime) {
+          lastTime = video.currentTime;
+          lastProgress = performance.now();
+        } else if (performance.now() - lastProgress > 3000) {
+          return finish({ ok: false, error: "视频缓冲时间过长，请等待加载后重试" });
+        }
         if (!document.contains(video)) return finish({ ok: false, error: "视频在录制中离开页面" });
         const rect = video.getBoundingClientRect();
         const current = { left: rect.left, top: rect.top, width: rect.width, height: rect.height,
@@ -513,18 +593,26 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
       if (video.ended) done();
       else check();
     });
+    signal.throwIfAborted();
     video.pause();
     clearInterval(state.unmuteTimer);
     state.unmuteTimer = null;
     return result;
   }
 
-  function seekToStart(video) {
+  function seekToStart(video, signal) {
     video.currentTime = 0;
-    if (!video.seeking) return Promise.resolve();
-    return new Promise((resolve) => {
-      const done = () => { clearTimeout(timer); video.removeEventListener("seeked", done); resolve(); };
+    if (!video.seeking && video.currentTime <= 0.1) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const done = () => {
+        clearTimeout(timer);
+        video.removeEventListener("seeked", done);
+        signal.removeEventListener("abort", done);
+        if (signal.aborted || video.seeking || video.currentTime > 0.1) reject(new Error("视频定位失败"));
+        else resolve();
+      };
       const timer = setTimeout(done, 1500);
+      signal.addEventListener("abort", done, { once: true });
       video.addEventListener("seeked", done, { once: true });
     });
   }
@@ -555,7 +643,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     }
   }
 
-  async function expandScrollableMedia(articles) {
+  async function expandScrollableMedia(articles, signal) {
     const processedScrollers = new Set();
     const processedBlocks = new Set();
     for (const article of articles) {
@@ -566,7 +654,9 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
         processedScrollers.add(scroller);
 
         const originalScrollLeft = scroller.scrollLeft;
-        const items = await collectCarouselImages(scroller);
+        state.originalMediaScrolls.push({ element: scroller, left: originalScrollLeft });
+        const items = await collectCarouselImages(scroller, signal);
+        signal.throwIfAborted();
         scroller.scrollLeft = originalScrollLeft;
         if (items.length < 2 && !scroller.querySelector("video")) continue;
         if (!items.length) continue;
@@ -584,7 +674,8 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
           gallery,
           scrollLeft: originalScrollLeft
         });
-        await waitForImageElements(Array.from(gallery.querySelectorAll("img")), 3000);
+        await waitForImageElements(Array.from(gallery.querySelectorAll("img")), 3000, signal);
+        signal.throwIfAborted();
       }
     }
   }
@@ -622,7 +713,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     return null;
   }
 
-  async function collectCarouselImages(scroller) {
+  async function collectCarouselImages(scroller, signal) {
     const collected = new Map();
     const collectVisible = () => {
       for (const image of scroller.querySelectorAll("img")) {
@@ -645,15 +736,17 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     let position = 0;
     for (let pass = 0; pass < 30; pass += 1) {
       scroller.scrollTo({ left: position, behavior: "instant" });
-      await animationFrames(2);
+      await animationFrames(2, signal);
+      signal.throwIfAborted();
       await new Promise((resolve) => setTimeout(resolve, 100));
+      signal.throwIfAborted();
       collectVisible();
 
       const maximum = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
-      if (position >= maximum - 1) break;
+      if (position >= maximum - 1) return Array.from(collected.values());
       position = Math.min(maximum, position + step);
     }
-    return Array.from(collected.values());
+    throw new Error("横向图库过长，无法完整截取");
   }
 
   function buildMediaGallery(items) {
@@ -676,21 +769,12 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
     return gallery;
   }
 
-  function getStatusId(article) {
-    const links = article.querySelectorAll('a[href*="/status/"]');
-    for (const link of links) {
-      const id = link.getAttribute("href")?.match(/\/status\/(\d+)/)?.[1];
-      if (id) return id;
-    }
-    return null;
-  }
-
   function isVisible(element) {
     const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return !element.parentElement.closest("article") && rect.width > 0 && rect.height > 0;
   }
 
-  function waitForImages(visibleOnly = true) {
+  function waitForImages(visibleOnly, signal) {
     // Wait for offscreen lazy images when their segment enters the viewport.
     // Eager images also settle layout during preparation; hidden gallery
     // originals never contribute to either the layout or the current frame.
@@ -702,28 +786,58 @@ function xShotRestoreVideo({ video, muted, volume, time, paused }, stillOnly) {
         return rect.bottom >= 0 && rect.top < window.innerHeight &&
           rect.right >= 0 && rect.left < window.innerWidth;
       });
-    return waitForImageElements(images, 1500);
+    return waitForImageElements(images, 1500, signal);
   }
 
-  function waitForImageElements(images, timeout) {
-    const pending = images.filter((image) => !image.complete).map((image) => new Promise((resolve) => {
-      const done = () => {
-        clearTimeout(timer);
-        image.removeEventListener("load", done);
-        image.removeEventListener("error", done);
-        resolve();
+  async function waitForImageElements(images, timeout, signal) {
+    signal.throwIfAborted();
+    const pending = images.filter((image) => !image.complete);
+    if (pending.length) {
+      await new Promise((resolve, reject) => {
+        const remaining = new Set(pending);
+        const timer = setTimeout(done, timeout);
+        function done() {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", done);
+          for (const image of pending) {
+            image.removeEventListener("load", loaded);
+            image.removeEventListener("error", loaded);
+          }
+          if (signal.aborted) reject(signal.reason);
+          else resolve();
+        }
+        function loaded(event) {
+          remaining.delete(event.target);
+          if (!remaining.size) done();
+        }
+        signal.addEventListener("abort", done, { once: true });
+        for (const image of pending) {
+          image.addEventListener("load", loaded);
+          image.addEventListener("error", loaded);
+        }
+      });
+    }
+    if (images.some((image) => !image.complete || !image.naturalWidth)) {
+      throw new Error("帖子图片未完整加载，请等待图片显示后重试");
+    }
+  }
+
+  function animationFrames(count, signal) {
+    signal.throwIfAborted();
+    return new Promise((resolve, reject) => {
+      let frame;
+      const abort = () => {
+        cancelAnimationFrame(frame);
+        reject(signal.reason);
       };
-      const timer = setTimeout(done, timeout);
-      image.addEventListener("load", done, { once: true });
-      image.addEventListener("error", done, { once: true });
-      if (image.complete) done();
-    }));
-    return Promise.all(pending);
-  }
-
-  function animationFrames(count) {
-    return new Promise((resolve) => {
-      const next = () => count-- > 0 ? requestAnimationFrame(next) : resolve();
+      signal.addEventListener("abort", abort, { once: true });
+      const next = () => {
+        if (count-- > 0) frame = requestAnimationFrame(next);
+        else {
+          signal.removeEventListener("abort", abort);
+          resolve();
+        }
+      };
       next();
     });
   }

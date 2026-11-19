@@ -1,4 +1,7 @@
-let job = null;
+let jobId = null;
+let heartbeat = null;
+let jobController = null;
+let videoBase = null;
 const pngStitcher = new XShotPngStitcher();
 let recording = null;
 const VIDEO_LIMITS = { width: 1440, height: 2560, fps: 24, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 96_000, maxBytes: 40_000_000 };
@@ -13,68 +16,67 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleMessage(message) {
   if (message.type === "X_SHOT_BEGIN") {
-    const result = pngStitcher.begin(message.capture);
-    job = pngStitcher.job;
-    return result;
+    if (jobId || !message.jobId) throw new Error("截图任务冲突");
+    jobId = message.jobId;
+    jobController = new AbortController();
+    heartbeat = setInterval(async () => {
+      try {
+        const status = await chrome.runtime.sendMessage({ type: "X_SHOT_ALIVE", jobId });
+        if (status?.alive) return;
+      } catch { /* The worker or extension context has gone away. */ }
+      dispose();
+      window.close();
+    }, 5000);
+    return pngStitcher.begin(message.capture);
   }
+  if (!jobId || jobId !== message.jobId) throw new Error("截图任务已结束");
   if (message.type === "X_SHOT_FRAME") return pngStitcher.addFrame(message.dataUrl, message.frame);
   if (message.type === "X_SHOT_FINISH") return finish(Boolean(message.forVideo));
   if (message.type === "X_SHOT_RECORD_BEGIN") return beginRecording(message);
   if (message.type === "X_SHOT_RECORD_CALIBRATE") return calibrateRecording(message.markers);
   if (message.type === "X_SHOT_RECORD_START") return startRecording(message.videoRect);
   if (message.type === "X_SHOT_RECORD_FINISH") return finishRecording();
-  if (message.type === "X_SHOT_RECORD_ABORT") { abortRecording(); return { ok: true }; }
   return { ok: false, error: "未知的图片处理请求" };
 }
 
-async function finish(forVideo = false) {
-  if (!forVideo) {
-    const result = pngStitcher.finish();
-    job = null;
-    return result;
-  }
-  if (!job?.canvas) throw new Error("没有可复制的截图内容");
-  let output = job.canvas;
-  if (forVideo) {
-    const ratio = Math.min(0.5, VIDEO_LIMITS.width / output.width, VIDEO_LIMITS.height / output.height);
-    const reduced = document.createElement("canvas");
-    reduced.width = Math.max(2, Math.floor(output.width * ratio / 2) * 2);
-    reduced.height = Math.max(2, Math.floor(output.height * ratio / 2) * 2);
-    reduced.getContext("2d").drawImage(output, 0, 0, reduced.width, reduced.height);
-    output = reduced;
-  }
-  const dataUrl = output.toDataURL("image/png");
-  if (!dataUrl || dataUrl === "data:,") throw new Error("PNG 编码失败");
+function dispose() {
+  clearInterval(heartbeat);
+  jobId = null;
+  jobController?.abort();
+  jobController = null;
+  abortRecording();
+  pngStitcher.abort();
+  if (videoBase) videoBase.width = videoBase.height = 0;
+  videoBase = null;
+}
+window.addEventListener("pagehide", dispose);
 
-  const result = {
-    ok: true,
-    dataUrl,
-    width: output.width,
-    height: output.height,
-    scaled: job.outputScale < job.sourceScale - 0.001
-  };
-  job = null;
-  pngStitcher.job = null;
-  return result;
+function finish(forVideo) {
+  try {
+    if (!forVideo) return pngStitcher.finish();
+    const source = pngStitcher.job?.canvas;
+    if (!source) throw new Error("没有可录制的截图内容");
+    const ratio = Math.min(0.5, VIDEO_LIMITS.width / source.width, VIDEO_LIMITS.height / source.height);
+    videoBase = document.createElement("canvas");
+    videoBase.width = Math.max(2, Math.floor(source.width * ratio / 2) * 2);
+    videoBase.height = Math.max(2, Math.floor(source.height * ratio / 2) * 2);
+    videoBase.getContext("2d").drawImage(source, 0, 0, videoBase.width, videoBase.height);
+    return { ok: true };
+  } finally {
+    pngStitcher.abort();
+  }
 }
 
-function loadImage(dataUrl) {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("无法读取当前截图"));
-    image.src = dataUrl;
-  });
-}
-
-async function beginRecording({ streamId, still, capture, layout }) {
+async function beginRecording({ streamId, capture, layout }) {
   if (recording) throw new Error("已有视频录制任务");
   // Let Chrome select an AVC profile/level for the actual output dimensions.
   // isTypeSupported() does not guarantee that the device encoder can start.
   const mimeTypes = ["video/mp4", "video/mp4;codecs=avc1,mp4a.40.2"]
     .filter((type) => MediaRecorder.isTypeSupported(type));
   if (!mimeTypes.length) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
-  const base = await loadImage(still);
+  const base = videoBase;
+  const signal = jobController.signal;
+  if (!base) throw new Error("缺少录制底图");
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d", { alpha: false });
   const tabStream = await navigator.mediaDevices.getUserMedia({
@@ -83,10 +85,19 @@ async function beginRecording({ streamId, still, capture, layout }) {
   });
   let drawingStream = null;
   const tabVideo = document.createElement("video");
+  const releaseSetup = () => {
+    drawingStream?.getTracks().forEach((track) => track.stop());
+    tabStream.getTracks().forEach((track) => track.stop());
+    tabVideo.srcObject = null;
+    canvas.width = canvas.height = 0;
+  };
+  signal.addEventListener("abort", releaseSetup, { once: true });
   try {
+    signal.throwIfAborted();
     tabVideo.muted = true;
     tabVideo.srcObject = tabStream;
     await tabVideo.play();
+    if (!tabStream.getAudioTracks().length) throw new Error("无法取得标签页音轨，已取消录制");
     const profiles = [
       VIDEO_LIMITS,
       { ...VIDEO_LIMITS, width: 720, height: 1280, videoBitsPerSecond: 4_000_000 },
@@ -96,7 +107,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
     let composition = null;
     let encoderError = null;
     for (const limits of profiles) {
-      composition = createVideoComposition(capture, layout, limits, base.naturalWidth);
+      composition = createVideoComposition(capture, layout, limits, base.width);
       canvas.width = composition.width;
       canvas.height = composition.height;
       const drawProbeFrame = () => context.drawImage(base, 0, 0, canvas.width, canvas.height);
@@ -111,10 +122,13 @@ async function beginRecording({ streamId, still, capture, layout }) {
         };
         try {
           // Discard the probe recording; the exported MP4 starts only after calibration.
-          await probeMp4Encoding(combined, options, drawProbeFrame);
+          await probeMp4Encoding(combined, options, drawProbeFrame, signal);
           recorder = new MediaRecorder(combined, options);
           break;
-        } catch (error) { encoderError = error; }
+        } catch (error) {
+          signal.throwIfAborted();
+          encoderError = error;
+        }
       }
       if (recorder) break;
       drawingStream.getTracks().forEach((track) => track.stop());
@@ -123,78 +137,103 @@ async function beginRecording({ streamId, still, capture, layout }) {
     if (!recorder) {
       throw new Error("当前浏览器无法启动 MP4 编码，已尝试降低分辨率和码率。请更新 Chrome 后重试。", { cause: encoderError });
     }
+    signal.throwIfAborted();
     const chunks = [];
-    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
+    const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, bytes: 0, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
     current.stopPromise = new Promise((resolve) => {
-      recorder.addEventListener("stop", resolve, { once: true });
+      recorder.addEventListener("stop", () => {
+        if (recording === current && !current.finishing && !current.timeLimit && !current.tooLarge && !current.error) {
+          failRecording(current, new Error("MP4 录制意外停止，请重试"));
+        }
+        resolve();
+      }, { once: true });
     });
-    recorder.ondataavailable = (event) => {
-      if (event.data?.size) chunks.push(event.data);
-      if (chunks.reduce((sum, chunk) => sum + chunk.size, 0) > VIDEO_LIMITS.maxBytes) {
-        current.tooLarge = true;
-        if (recorder.state !== "inactive") recorder.stop();
-      }
-    };
-    recorder.onerror = (event) => { current.error = event.error || new Error("MP4 编码失败"); };
+    recorder.ondataavailable = (event) => appendChunk(current, event.data);
+    recorder.onerror = (event) => failRecording(current, event.error || new Error("MP4 编码失败，请重试"));
+    for (const track of tabStream.getTracks()) {
+      track.addEventListener("ended", () => failRecording(current, new Error("标签页录屏或音轨中断")), { once: true });
+    }
     recording = current;
     return { ok: true, width: canvas.width, height: canvas.height, hasAudioTrack: tabStream.getAudioTracks().length > 0 };
   } catch (error) {
-    if (recording) abortRecording();
-    else {
-      drawingStream?.getTracks().forEach((track) => track.stop());
-      tabStream.getTracks().forEach((track) => track.stop());
-      tabVideo.srcObject = null;
-    }
+    releaseSetup();
     throw error;
+  } finally {
+    signal.removeEventListener("abort", releaseSetup);
   }
 }
 
-async function probeMp4Encoding(stream, options, drawFrame) {
+function failRecording(current, error) {
+  if (current !== recording || current.error) return;
+  current.error = error;
+  clearInterval(current.drawTimer);
+  chrome.runtime.sendMessage({ type: "X_SHOT_RECORD_ERROR", jobId,
+    error: `MP4 录制失败：${error.message || error}` }).catch(() => {});
+  if (current.recorder.state !== "inactive") current.recorder.stop();
+}
+
+function appendChunk(current, chunk) {
+  if (current !== recording || current.error || !chunk?.size) return;
+  current.bytes += chunk.size;
+  if (current.bytes > VIDEO_LIMITS.maxBytes) {
+    current.chunks.length = 0;
+    failRecording(current, new Error("MP4 编码结果超过 40 MB，请缩短视频后重试"));
+    return;
+  }
+  current.chunks.push(chunk);
+  // Reserve room for one more timeslice and the MP4 muxer's final data.
+  if (current.bytes >= VIDEO_LIMITS.maxBytes - 2_000_000 && !current.tooLarge && !current.finishing) {
+    current.tooLarge = true;
+    if (current.recorder.state !== "inactive") current.recorder.stop();
+    chrome.runtime.sendMessage({ type: "X_SHOT_RECORD_LIMIT", jobId }).catch(() => {});
+  }
+}
+
+async function probeMp4Encoding(stream, options, drawFrame, signal) {
+  signal?.throwIfAborted();
   const recorder = new MediaRecorder(stream, options);
   await new Promise((resolve, reject) => {
     let bytes = 0;
-    let error = null;
-    let settled = false;
+    let flushTimer;
     const requestFrame = () => {
-      drawFrame();
-      stream.getVideoTracks().forEach((track) => track.requestFrame?.());
+      try {
+        drawFrame();
+        stream.getVideoTracks().forEach((track) => track.requestFrame?.());
+      } catch (error) { finish(error); }
     };
-    const finish = () => {
-      if (settled) return;
-      settled = true;
+    const abort = () => finish(signal.reason);
+    function finish(error) {
+      signal?.removeEventListener("abort", abort);
       clearInterval(frameTimer);
-      clearTimeout(timeout);
-      clearTimeout(stopTimeout);
+      clearTimeout(sampleTimer);
+      clearTimeout(flushTimer);
       recorder.ondataavailable = recorder.onerror = recorder.onstop = null;
-      if (recorder.state !== "inactive") recorder.stop();
+      try {
+        if (recorder.state !== "inactive") recorder.stop();
+      } catch (stopError) { error ||= stopError; }
       if (error || !bytes) reject(error || new Error("MP4 编码测试未产生视频数据"));
       else resolve();
-    };
+    }
+    function requestStop() {
+      if (flushTimer !== undefined) return;
+      // Some encoders emit all data after stop(). Give that flush its own deadline.
+      flushTimer = setTimeout(() => finish(new Error("MP4 编码器未能正常停止")), 5000);
+      try { if (recorder.state !== "inactive") recorder.stop(); }
+      catch (error) { finish(error); }
+    }
     const frameTimer = setInterval(requestFrame, 40);
-    const timeout = setTimeout(() => {
-      // Some MP4 muxers emit their first bytes only when stopped/flushed.
-      if (recorder.state !== "inactive") recorder.stop();
-    }, 2500);
-    const stopTimeout = setTimeout(() => {
-      error ||= new Error("MP4 编码器未能正常停止");
-      finish();
-    }, 3000);
+    const sampleTimer = setTimeout(requestStop, 2500);
     recorder.ondataavailable = (event) => {
       bytes += event.data?.size || 0;
-      if (bytes && recorder.state !== "inactive") recorder.stop();
+      if (bytes) requestStop();
     };
-    recorder.onerror = (event) => {
-      error = event.error || new Error("MP4 编码测试失败");
-      if (recorder.state !== "inactive") recorder.stop();
-    };
-    recorder.onstop = finish;
+    recorder.onerror = (event) => finish(event.error || new Error("MP4 编码测试失败"));
+    recorder.onstop = () => finish();
+    signal?.addEventListener("abort", abort, { once: true });
     try {
       recorder.start(100);
       requestFrame();
-    } catch (startError) {
-      error = startError;
-      finish();
-    }
+    } catch (error) { finish(error); }
   });
 }
 
@@ -211,8 +250,8 @@ async function waitForTabCalibration(tabVideo, markers) {
   const deadline = Date.now() + 4000;
   while (Date.now() < deadline) {
     if (tabVideo.videoWidth > 0 && tabVideo.videoHeight > 0 && tabVideo.readyState >= 2) {
-      probe.width = tabVideo.videoWidth;
-      probe.height = tabVideo.videoHeight;
+      if (probe.width !== tabVideo.videoWidth) probe.width = tabVideo.videoWidth;
+      if (probe.height !== tabVideo.videoHeight) probe.height = tabVideo.videoHeight;
       probeContext.drawImage(tabVideo, 0, 0);
       try {
         return calibrateTabStream(probeContext.getImageData(0, 0, probe.width, probe.height), markers);
@@ -302,8 +341,17 @@ function startRecording(videoRect) {
   current.layout.videoRect = videoRect;
   current.liveCrop = mapVideoRectToStream(videoRect, current.calibration);
   drawRecordingFrame();
-  current.drawTimer = setInterval(drawRecordingFrame, 1000 / VIDEO_LIMITS.fps);
+  current.drawTimer = setInterval(() => {
+    try { drawRecordingFrame(); } catch (error) { failRecording(current, error); }
+  }, 1000 / VIDEO_LIMITS.fps);
   current.recorder.start(1000);
+  // Bound the encoder itself even when playback acknowledgement is delayed.
+  current.durationTimer = setTimeout(() => {
+    if (recording !== current || current.recorder.state === "inactive") return;
+    current.timeLimit = true;
+    current.recorder.stop();
+    chrome.runtime.sendMessage({ type: "X_SHOT_RECORD_LIMIT", jobId }).catch(() => {});
+  }, 30000);
   return { ok: true };
 }
 
@@ -371,18 +419,16 @@ function drawRecordingFrame() {
   if (!current) return;
   if (current.calibration && current.tabVideo.readyState >= 2 &&
       (current.tabVideo.videoWidth !== current.calibration.width || current.tabVideo.videoHeight !== current.calibration.height)) {
-    current.error = new Error("录屏尺寸在录制中发生变化，请重试");
-    if (current.recorder.state !== "inactive") current.recorder.stop();
-    return;
+    throw new Error("录屏尺寸在录制中发生变化，请重试");
   }
   const { base, context, capture, layout, composition } = current;
   context.fillStyle = layout.backgroundColor || "#000";
   context.fillRect(0, 0, composition.width, composition.height);
   if (composition.preservePostLayout) {
-    context.drawImage(base, 0, 0, base.naturalWidth, base.naturalHeight,
+    context.drawImage(base, 0, 0, base.width, base.height,
       0, 0, composition.width, composition.height);
   } else if (composition.top.height > 0) {
-    context.drawImage(base, 0, 0, base.naturalWidth, composition.top.sourceHeight / capture.height * base.naturalHeight,
+    context.drawImage(base, 0, 0, base.width, composition.top.sourceHeight / capture.height * base.height,
       0, 0, composition.width, composition.top.height);
   }
   const destination = composition.video;
@@ -392,17 +438,17 @@ function drawRecordingFrame() {
       destination.x, destination.y, destination.width, destination.height);
   } else {
     const source = layout.documentVideoRect;
-    context.drawImage(base, source.left / capture.width * base.naturalWidth, source.top / capture.height * base.naturalHeight,
-      source.width / capture.width * base.naturalWidth, source.height / capture.height * base.naturalHeight,
+    context.drawImage(base, source.left / capture.width * base.width, source.top / capture.height * base.height,
+      source.width / capture.width * base.width, source.height / capture.height * base.height,
       destination.x, destination.y, destination.width, destination.height);
   }
   if (composition.preservePostLayout) return;
   for (const thumb of composition.thumbnails) {
     const photo = thumb.source;
-    const sx = photo.left / capture.width * base.naturalWidth;
-    const sy = photo.top / capture.height * base.naturalHeight;
-    const sw = photo.width / capture.width * base.naturalWidth;
-    const sh = photo.height / capture.height * base.naturalHeight;
+    const sx = photo.left / capture.width * base.width;
+    const sy = photo.top / capture.height * base.height;
+    const sw = photo.width / capture.width * base.width;
+    const sh = photo.height / capture.height * base.height;
     const fitted = Math.min(thumb.width / sw, thumb.height / sh);
     context.fillStyle = "#000";
     context.fillRect(thumb.x, thumb.y, thumb.width, thumb.height);
@@ -411,8 +457,8 @@ function drawRecordingFrame() {
       sw * fitted, sh * fitted);
   }
   if (composition.footer.height > 0 && composition.footer.sourceHeight > 0) {
-    context.drawImage(base, 0, composition.footer.sourceTop / capture.height * base.naturalHeight,
-      base.naturalWidth, composition.footer.sourceHeight / capture.height * base.naturalHeight,
+    context.drawImage(base, 0, composition.footer.sourceTop / capture.height * base.height,
+      base.width, composition.footer.sourceHeight / capture.height * base.height,
       0, composition.footer.y, composition.width, composition.footer.height);
   }
 }
@@ -422,10 +468,12 @@ async function finishRecording() {
   if (!current) throw new Error("视频录制任务不存在");
   if (!current.drawTimer) throw new Error("视频录制尚未开始");
   try {
+    current.finishing = true;
     if (current.recorder.state !== "inactive") current.recorder.stop();
     await current.stopPromise;
     if (current.error) throw current.error;
     const blob = new Blob(current.chunks, { type: "video/mp4" });
+    abortRecording();
     if (!blob.size) throw new Error("录制结果为空");
     const dataUrl = await new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -433,19 +481,28 @@ async function finishRecording() {
       reader.onerror = () => reject(new Error("无法读取录制结果"));
       reader.readAsDataURL(blob);
     });
-    return { ok: true, dataUrl, bytes: blob.size, truncated: current.tooLarge, width: current.canvas.width, height: current.canvas.height };
+    return { ok: true, dataUrl, bytes: blob.size, truncated: current.tooLarge };
   } finally {
-    abortRecording();
+    if (recording === current) abortRecording();
   }
 }
 
 function abortRecording() {
   if (!recording) return;
-  clearInterval(recording.drawTimer);
-  if (recording.recorder.state !== "inactive") recording.recorder.stop();
-  recording.drawingStream.getTracks().forEach((track) => track.stop());
-  recording.tabStream.getTracks().forEach((track) => track.stop());
-  recording.tabVideo.srcObject = null;
+  const current = recording;
   recording = null;
+  clearTimeout(current.durationTimer);
+  clearInterval(current.drawTimer);
+  current.recorder.ondataavailable = current.recorder.onerror = null;
+  try {
+    if (current.recorder.state !== "inactive") current.recorder.stop();
+  } finally {
+    current.drawingStream.getTracks().forEach((track) => track.stop());
+    current.tabStream.getTracks().forEach((track) => track.stop());
+    current.tabVideo.srcObject = null;
+    current.chunks.length = 0;
+    current.canvas.width = current.canvas.height = 0;
+    current.base.width = current.base.height = 0;
+    videoBase = null;
+  }
 }
-

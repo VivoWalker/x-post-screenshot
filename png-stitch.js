@@ -4,13 +4,13 @@ class XShotPngStitcher {
   }
 
   begin(capture) {
+    this.abort();
     this.job = {
       capture,
       canvas: null,
       context: null,
       outputScale: null,
       sourceScale: null,
-      frameCount: 0,
       lastDestinationBottom: 0
     };
     return { ok: true };
@@ -20,37 +20,37 @@ class XShotPngStitcher {
     const job = this.job;
     if (!job) throw new Error("截图任务不存在");
     const image = await this.loadImage(dataUrl);
+    if (job !== this.job) throw new Error("截图任务已取消");
     if (!job.canvas) this.initializeCanvas(image, frame);
 
     const sourceScaleX = image.naturalWidth / frame.viewportWidth;
     const sourceScaleY = image.naturalHeight / frame.viewportHeight;
-    const cropTop = frame.contentTop - frame.scrollY;
-    const cropHeight = frame.contentBottom - frame.contentTop;
-    const destinationY = frame.contentTop - job.capture.top;
-    const destinationBottomY = frame.contentBottom - job.capture.top;
-    let destinationTop = Math.max(0, Math.floor(destinationY * job.outputScale));
-    const destinationBottom = Math.min(
-      job.canvas.height,
-      Math.ceil(destinationBottomY * job.outputScale)
-    );
-
-    // Integer pixel boundaries and a one-pixel overlap prevent white seams.
-    if (job.frameCount > 0) {
-      destinationTop = Math.max(0, Math.min(destinationTop, job.lastDestinationBottom) - 1);
+    if (sourceScaleX !== job.sourceScale || sourceScaleY !== job.sourceScaleY) {
+      throw new Error("截屏缩放比例变化，请重试");
     }
-    const destinationHeight = Math.max(1, destinationBottom - destinationTop);
+    // Each CSS boundary maps to exactly one output row for both neighbours.
+    const destinationTop = job.lastDestinationBottom;
+    const destinationBottom = frame.contentBottom >= job.capture.top + job.capture.height
+      ? job.canvas.height : Math.round((frame.contentBottom - job.capture.top) * job.outputScale);
+    const destinationHeight = destinationBottom - destinationTop;
+    if (destinationHeight === 0) return { ok: true };
+    // Map the rounded destination back into the source. Stretching an unrounded
+    // source interval over integer rows otherwise blurs alternating pixel rows.
+    const sourceY = (row) => (job.capture.top - frame.scrollY + row / job.outputScale) * sourceScaleY;
+    const sourceTop = Math.max(0, sourceY(destinationTop));
+    const sourceBottom = Math.min(image.naturalHeight, sourceY(destinationBottom),
+      (job.capture.top + job.capture.height - frame.scrollY) * sourceScaleY);
     job.context.drawImage(
       image,
       job.capture.left * sourceScaleX,
-      cropTop * sourceScaleY,
+      sourceTop,
       job.capture.width * sourceScaleX,
-      cropHeight * sourceScaleY,
+      sourceBottom - sourceTop,
       0,
       destinationTop,
       job.canvas.width,
       destinationHeight
     );
-    job.frameCount += 1;
     job.lastDestinationBottom = destinationBottom;
     return { ok: true };
   }
@@ -67,6 +67,7 @@ class XShotPngStitcher {
       Math.sqrt(100000000 / (rawWidth * rawHeight))
     );
     job.sourceScale = sourceScale;
+    job.sourceScaleY = image.naturalHeight / frame.viewportHeight;
     job.outputScale = sourceScale * limitScale;
     job.canvas = document.createElement("canvas");
     job.canvas.width = Math.max(1, Math.ceil(job.capture.width * job.outputScale));
@@ -80,18 +81,23 @@ class XShotPngStitcher {
 
   finish() {
     const job = this.job;
-    if (!job?.canvas) throw new Error("没有可复制的截图内容");
-    const dataUrl = job.canvas.toDataURL("image/png");
-    if (!dataUrl || dataUrl === "data:,") throw new Error("PNG 编码失败");
-    const result = {
-      ok: true,
-      dataUrl,
-      width: job.canvas.width,
-      height: job.canvas.height,
-      scaled: job.outputScale < job.sourceScale - 0.001
-    };
+    try {
+      if (!job?.canvas) throw new Error("没有可复制的截图内容");
+      const dataUrl = job.canvas.toDataURL("image/png");
+      if (!dataUrl || dataUrl === "data:,") throw new Error("PNG 编码失败");
+      return {
+        ok: true, dataUrl,
+        width: job.canvas.width, height: job.canvas.height,
+        scaled: job.outputScale < job.sourceScale - 0.001
+      };
+    } finally {
+      this.abort();
+    }
+  }
+
+  abort() {
+    if (this.job?.canvas) this.job.canvas.width = this.job.canvas.height = 0;
     this.job = null;
-    return result;
   }
 
   loadImage(dataUrl) {
