@@ -62,6 +62,90 @@ class BrowserSmoke(unittest.TestCase):
         self.page.locator("#reply").click()
         self.assertEqual(self.page.evaluate("selection.selection.ids"), ["1", "2"])
 
+    def test_hover_across_cells_and_replaced_article(self):
+        self.page.add_style_tag(path=str(ROOT / "content.css"))
+        self.page.evaluate("""() => {
+          const cell=document.createElement('div'); cell.dataset.testid='cellInnerDiv';
+          cell.style.position='relative'; reply.before(cell); cell.append(reply);
+          const hit=document.createElement('div'); hit.id='hit';
+          hit.style='position:absolute;inset:0'; cell.append(hit);
+        }""")
+        self.script("content.js")
+        self.page.evaluate("respond({type:'X_SHOT_ENTER'})")
+        self.page.locator("#parent").hover()
+        self.page.locator("#hit").hover(position={"x": 80, "y": 50})
+        self.page.wait_for_function("""() => {
+          const mark=document.querySelector('.x-shot-hover-box') || document.querySelector('.x-shot-hovered');
+          return mark && !mark.hidden && mark.getBoundingClientRect().top === reply.getBoundingClientRect().top;
+        }""", timeout=1200)
+        self.page.evaluate("reply.replaceWith(reply.cloneNode(true)); reply.style.marginTop='8px'")
+        self.page.wait_for_function("""() => document.querySelector('.x-shot-hover-box')?.getBoundingClientRect().top
+          === reply.getBoundingClientRect().top""")
+        self.page.keyboard.press("Escape")
+        self.assertEqual(self.page.locator(".x-shot-selection-box").count(), 0)
+
+    def test_multi_capture_only_picked_posts(self):
+        self.page.set_viewport_size({"width": 800, "height": 420})
+        self.page.add_style_tag(path=str(ROOT / "content.css"))
+        self.page.evaluate("""() => {
+          const first=document.querySelector('#parent');
+          first.style='background:red;height:600px';
+          reply.style='background:blue;height:300px';
+          const last=document.createElement('article');
+          last.id='last'; last.style='background:lime;width:200px;margin-left:30px';
+          last.innerHTML='<a href="/c/status/3"><time>3</time></a><video width="10" height="10"></video>';
+          reply.after(last);
+        }""")
+        for script in ["content.js", "capture-controller.js", "png-stitch.js"]:
+            self.script(script)
+        self.page.evaluate("respond({type:'X_SHOT_ENTER'})")
+        self.page.locator("#last").click(modifiers=["Shift"])
+        self.page.locator("#reply").click()
+        self.page.locator("#reply").click()
+        self.page.locator("#parent").click()
+        self.page.evaluate("last.replaceWith(last.cloneNode(true))")
+        self.page.keyboard.press("Enter")
+        self.assertEqual(self.page.evaluate("selection.selection.ids"), ["1", "3"])
+        self.assertEqual(self.page.locator(".x-shot-selection-box").count(), 0)
+        self.page.evaluate("""() => { window.captureResult=(async () => {
+          const initial=scrollY;
+          chrome.tabs={query:async()=>[{id:1}],sendMessage:async()=>({ok:true}),
+            captureVisibleTab:()=>new Promise(resolve=>{window.nextFrame=resolve;})};
+          const job={tabId:1,windowId:1,controller:new AbortController(),step:f=>f(),
+            page:async(type,fields)=>requireSuccess(await request(type,fields))};
+          const prepared=await job.page('X_SHOT_PREPARE',{selection:selection.selection});
+          const stitch=new XShotPngStitcher();
+          stitch.begin(prepared.capture);
+          await captureFrames(job,prepared.capture,(url,frame)=>stitch.addFrame(url,frame));
+          const pixels=stitch.job.context;
+          const rgb=(x,y)=>Array.from(pixels.getImageData(x,y,1,1).data).slice(0,3);
+          const colors=[rgb(120,599),rgb(120,600),rgb(120,739),rgb(250,680)];
+          const png=stitch.finish();
+          await job.page('X_SHOT_RESTORE');
+          return [prepared.hasVideo,png.width,png.height,colors,initial===scrollY];
+        })().finally(()=>{window.finished=true;}); }""")
+        while True:
+            self.page.wait_for_function("window.finished || !!window.nextFrame", timeout=5000)
+            if self.page.evaluate("Boolean(window.finished)"):
+                break
+            frame = "data:image/png;base64," + base64.b64encode(self.page.screenshot()).decode()
+            self.page.evaluate("url => { nextFrame(url); window.nextFrame=null; }", frame)
+        result = self.page.evaluate("captureResult")
+        self.assertEqual(result, [False, 300, 740,
+                         [[255, 0, 0], [0, 255, 0], [0, 255, 0], [255, 255, 255]], True])
+
+    def test_empty_multiselect_and_cancel(self):
+        self.page.add_style_tag(path=str(ROOT / "content.css"))
+        self.script("content.js")
+        self.page.evaluate("respond({type:'X_SHOT_ENTER'})")
+        self.page.locator("#reply").click(modifiers=["Shift"])
+        self.page.locator("#reply").click()
+        self.page.keyboard.press("Enter")
+        self.assertTrue(self.page.evaluate("document.documentElement.classList.contains('x-shot-selecting')"))
+        self.page.keyboard.press("Escape")
+        self.assertEqual(self.page.locator(".x-shot-selection-box, .x-shot-selecting").count(), 0)
+        self.assertTrue(self.page.evaluate("window.selection === undefined"))
+
     def test_conversation_gallery_and_restore(self):
         self.page.add_style_tag(path=str(ROOT / "content.css"))
         self.page.evaluate("""() => {

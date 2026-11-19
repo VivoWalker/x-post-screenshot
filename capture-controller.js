@@ -122,25 +122,31 @@ async function captureVisibleFrame(job) {
 }
 
 async function captureFrames(job, capture, addFrame) {
-  const bottom = capture.top + capture.height;
-  let next = capture.top;
   let scrollY = capture.scrollY;
-  for (let index = 1; next < bottom; index++) {
-    const inset = Math.min(96, capture.viewportHeight * 0.15);
-    const fits = next >= scrollY + inset && bottom <= scrollY + capture.viewportHeight;
-    const y = fits ? scrollY : Math.max(0, Math.min(next - inset, capture.documentHeight - capture.viewportHeight));
-    const position = await job.page("X_SHOT_SCROLL", { y });
-    scrollY = position.scrollY;
-    const viewportBottom = scrollY + position.viewportHeight;
-    const end = bottom <= viewportBottom + 0.5 ? bottom : viewportBottom;
-    if (scrollY > next + 0.5 || end <= next || position.viewportWidth !== capture.viewportWidth ||
-        position.viewportHeight !== capture.viewportHeight) throw new Error("页面尺寸或滚动位置变化，请重试");
-    const url = await captureVisibleFrame(job);
-    await job.page("X_SHOT_VERIFY", { position });
-    await job.step(() => addFrame(url, { viewportWidth: position.viewportWidth, viewportHeight: position.viewportHeight,
-      scrollY, contentTop: next, contentBottom: end }));
-    next = end;
-    await job.step(() => notify(job.tabId, "progress", `正在截取第 ${index} 段…`));
+  let outputTop = 0;
+  let frameCount = 0;
+  const regions = capture.regions || [capture];
+  for (const [regionIndex, region] of regions.entries()) {
+    const bottom = region.top + region.height;
+    let next = region.top;
+    while (next < bottom) {
+      const inset = Math.min(96, capture.viewportHeight * 0.15);
+      const fits = next >= scrollY + inset && bottom <= scrollY + capture.viewportHeight;
+      const y = fits ? scrollY : Math.max(0, Math.min(next - inset, capture.documentHeight - capture.viewportHeight));
+      const position = await job.page("X_SHOT_SCROLL", { y });
+      scrollY = position.scrollY;
+      const viewportBottom = scrollY + position.viewportHeight;
+      const end = bottom <= viewportBottom + 0.5 ? bottom : viewportBottom;
+      if (scrollY > next + 0.5 || end <= next || position.viewportWidth !== capture.viewportWidth ||
+          position.viewportHeight !== capture.viewportHeight) throw new Error("页面尺寸或滚动位置变化，请重试");
+      const url = await captureVisibleFrame(job);
+      await job.page("X_SHOT_VERIFY", { position });
+      await job.step(() => addFrame(url, { viewportWidth: position.viewportWidth, viewportHeight: position.viewportHeight,
+        scrollY, contentTop: next, contentBottom: end, regionIndex, outputTop }));
+      next = end;
+      await job.step(() => notify(job.tabId, "progress", `正在截取第 ${++frameCount} 段…`));
+    }
+    outputTop += region.height;
   }
 }
 

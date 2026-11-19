@@ -29,26 +29,30 @@ class XShotPngStitcher {
       throw new Error("截屏缩放比例变化，请重试");
     }
     // Each CSS boundary maps to exactly one output row for both neighbours.
+    const region = job.capture.regions?.[frame.regionIndex] || job.capture;
+    const outputTop = frame.outputTop || 0;
+    const outputBottom = outputTop + (frame.contentBottom - region.top);
+    const lastRegion = !job.capture.regions || frame.regionIndex === job.capture.regions.length - 1;
     const destinationTop = job.lastDestinationBottom;
-    const destinationBottom = frame.contentBottom >= job.capture.top + job.capture.height
-      ? job.canvas.height : Math.round((frame.contentBottom - job.capture.top) * job.outputScale);
+    const destinationBottom = lastRegion && frame.contentBottom >= region.top + region.height
+      ? job.canvas.height : Math.round(outputBottom * job.outputScale);
     const destinationHeight = destinationBottom - destinationTop;
     if (destinationHeight === 0) return { ok: true };
     // Map the rounded destination back into the source. Stretching an unrounded
     // source interval over integer rows otherwise blurs alternating pixel rows.
-    const sourceY = (row) => (job.capture.top - frame.scrollY + row / job.outputScale) * sourceScaleY;
-    const sourceTop = Math.max(0, sourceY(destinationTop));
+    const sourceY = (row) => (region.top - frame.scrollY + row / job.outputScale - outputTop) * sourceScaleY;
+    const sourceTop = Math.max(0, (region.top - frame.scrollY) * sourceScaleY, sourceY(destinationTop));
     const sourceBottom = Math.min(image.naturalHeight, sourceY(destinationBottom),
-      (job.capture.top + job.capture.height - frame.scrollY) * sourceScaleY);
+      (region.top + region.height - frame.scrollY) * sourceScaleY);
     job.context.drawImage(
       image,
-      job.capture.left * sourceScaleX,
+      region.left * sourceScaleX,
       sourceTop,
-      job.capture.width * sourceScaleX,
+      region.width * sourceScaleX,
       sourceBottom - sourceTop,
       0,
       destinationTop,
-      job.canvas.width,
+      Math.min(job.canvas.width, Math.ceil(region.width * job.outputScale)),
       destinationHeight
     );
     job.lastDestinationBottom = destinationBottom;
