@@ -1,4 +1,6 @@
-let job = null;
+let jobId = null;
+let heartbeat = null;
+let videoBase = null;
 const pngStitcher = new XShotPngStitcher();
 let recording = null;
 const VIDEO_LIMITS = { width: 1440, height: 2560, fps: 24, videoBitsPerSecond: 8_000_000, audioBitsPerSecond: 96_000, maxBytes: 40_000_000 };
@@ -13,10 +15,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 async function handleMessage(message) {
   if (message.type === "X_SHOT_BEGIN") {
-    const result = pngStitcher.begin(message.capture);
-    job = pngStitcher.job;
-    return result;
+    if (jobId || !message.jobId) throw new Error("截图任务冲突");
+    jobId = message.jobId;
+    heartbeat = setInterval(async () => {
+      try {
+        const status = await chrome.runtime.sendMessage({ type: "X_SHOT_ALIVE", jobId });
+        if (status?.alive) return;
+      } catch { /* The worker or extension context has gone away. */ }
+      dispose();
+      window.close();
+    }, 5000);
+    return pngStitcher.begin(message.capture);
   }
+  if (!jobId || jobId !== message.jobId) throw new Error("截图任务已结束");
   if (message.type === "X_SHOT_FRAME") return pngStitcher.addFrame(message.dataUrl, message.frame);
   if (message.type === "X_SHOT_FINISH") return finish(Boolean(message.forVideo));
   if (message.type === "X_SHOT_RECORD_BEGIN") return beginRecording(message);
@@ -27,54 +38,42 @@ async function handleMessage(message) {
   return { ok: false, error: "未知的图片处理请求" };
 }
 
-async function finish(forVideo = false) {
-  if (!forVideo) {
-    const result = pngStitcher.finish();
-    job = null;
-    return result;
-  }
-  if (!job?.canvas) throw new Error("没有可复制的截图内容");
-  let output = job.canvas;
-  if (forVideo) {
-    const ratio = Math.min(0.5, VIDEO_LIMITS.width / output.width, VIDEO_LIMITS.height / output.height);
-    const reduced = document.createElement("canvas");
-    reduced.width = Math.max(2, Math.floor(output.width * ratio / 2) * 2);
-    reduced.height = Math.max(2, Math.floor(output.height * ratio / 2) * 2);
-    reduced.getContext("2d").drawImage(output, 0, 0, reduced.width, reduced.height);
-    output = reduced;
-  }
-  const dataUrl = output.toDataURL("image/png");
-  if (!dataUrl || dataUrl === "data:,") throw new Error("PNG 编码失败");
+function dispose() {
+  clearInterval(heartbeat);
+  jobId = null;
+  abortRecording();
+  pngStitcher.abort();
+  if (videoBase) videoBase.width = videoBase.height = 0;
+  videoBase = null;
+}
+window.addEventListener("pagehide", dispose);
 
-  const result = {
-    ok: true,
-    dataUrl,
-    width: output.width,
-    height: output.height,
-    scaled: job.outputScale < job.sourceScale - 0.001
-  };
-  job = null;
-  pngStitcher.job = null;
-  return result;
+function finish(forVideo) {
+  try {
+    if (!forVideo) return pngStitcher.finish();
+    const source = pngStitcher.job?.canvas;
+    if (!source) throw new Error("没有可录制的截图内容");
+    const ratio = Math.min(0.5, VIDEO_LIMITS.width / source.width, VIDEO_LIMITS.height / source.height);
+    videoBase = document.createElement("canvas");
+    videoBase.width = Math.max(2, Math.floor(source.width * ratio / 2) * 2);
+    videoBase.height = Math.max(2, Math.floor(source.height * ratio / 2) * 2);
+    videoBase.getContext("2d").drawImage(source, 0, 0, videoBase.width, videoBase.height);
+    return { ok: true };
+  } finally {
+    pngStitcher.abort();
+  }
 }
 
-function loadImage(dataUrl) {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("无法读取当前截图"));
-    image.src = dataUrl;
-  });
-}
-
-async function beginRecording({ streamId, still, capture, layout }) {
+async function beginRecording({ streamId, capture, layout }) {
   if (recording) throw new Error("已有视频录制任务");
   // Let Chrome select an AVC profile/level for the actual output dimensions.
   // isTypeSupported() does not guarantee that the device encoder can start.
   const mimeTypes = ["video/mp4", "video/mp4;codecs=avc1,mp4a.40.2"]
     .filter((type) => MediaRecorder.isTypeSupported(type));
   if (!mimeTypes.length) throw new Error("当前 Chrome 不支持 MP4 录制，请更新浏览器");
-  const base = await loadImage(still);
+  const base = videoBase;
+  const owner = jobId;
+  if (!base) throw new Error("缺少录制底图");
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d", { alpha: false });
   const tabStream = await navigator.mediaDevices.getUserMedia({
@@ -84,9 +83,11 @@ async function beginRecording({ streamId, still, capture, layout }) {
   let drawingStream = null;
   const tabVideo = document.createElement("video");
   try {
+    if (!owner || jobId !== owner) throw new Error("录制已取消");
     tabVideo.muted = true;
     tabVideo.srcObject = tabStream;
     await tabVideo.play();
+    if (!tabStream.getAudioTracks().length) throw new Error("无法取得标签页音轨，已取消录制");
     const profiles = [
       VIDEO_LIMITS,
       { ...VIDEO_LIMITS, width: 720, height: 1280, videoBitsPerSecond: 4_000_000 },
@@ -96,7 +97,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
     let composition = null;
     let encoderError = null;
     for (const limits of profiles) {
-      composition = createVideoComposition(capture, layout, limits, base.naturalWidth);
+      composition = createVideoComposition(capture, layout, limits, base.width);
       canvas.width = composition.width;
       canvas.height = composition.height;
       const drawProbeFrame = () => context.drawImage(base, 0, 0, canvas.width, canvas.height);
@@ -123,6 +124,7 @@ async function beginRecording({ streamId, still, capture, layout }) {
     if (!recorder) {
       throw new Error("当前浏览器无法启动 MP4 编码，已尝试降低分辨率和码率。请更新 Chrome 后重试。", { cause: encoderError });
     }
+    if (owner !== jobId) throw new Error("录制已取消");
     const chunks = [];
     const current = { base, canvas, context, tabStream, drawingStream, tabVideo, recorder, chunks, capture, layout, composition, calibration: null, tooLarge: false, error: null, drawTimer: null, stopPromise: null };
     current.stopPromise = new Promise((resolve) => {
@@ -379,10 +381,10 @@ function drawRecordingFrame() {
   context.fillStyle = layout.backgroundColor || "#000";
   context.fillRect(0, 0, composition.width, composition.height);
   if (composition.preservePostLayout) {
-    context.drawImage(base, 0, 0, base.naturalWidth, base.naturalHeight,
+    context.drawImage(base, 0, 0, base.width, base.height,
       0, 0, composition.width, composition.height);
   } else if (composition.top.height > 0) {
-    context.drawImage(base, 0, 0, base.naturalWidth, composition.top.sourceHeight / capture.height * base.naturalHeight,
+    context.drawImage(base, 0, 0, base.width, composition.top.sourceHeight / capture.height * base.height,
       0, 0, composition.width, composition.top.height);
   }
   const destination = composition.video;
@@ -392,17 +394,17 @@ function drawRecordingFrame() {
       destination.x, destination.y, destination.width, destination.height);
   } else {
     const source = layout.documentVideoRect;
-    context.drawImage(base, source.left / capture.width * base.naturalWidth, source.top / capture.height * base.naturalHeight,
-      source.width / capture.width * base.naturalWidth, source.height / capture.height * base.naturalHeight,
+    context.drawImage(base, source.left / capture.width * base.width, source.top / capture.height * base.height,
+      source.width / capture.width * base.width, source.height / capture.height * base.height,
       destination.x, destination.y, destination.width, destination.height);
   }
   if (composition.preservePostLayout) return;
   for (const thumb of composition.thumbnails) {
     const photo = thumb.source;
-    const sx = photo.left / capture.width * base.naturalWidth;
-    const sy = photo.top / capture.height * base.naturalHeight;
-    const sw = photo.width / capture.width * base.naturalWidth;
-    const sh = photo.height / capture.height * base.naturalHeight;
+    const sx = photo.left / capture.width * base.width;
+    const sy = photo.top / capture.height * base.height;
+    const sw = photo.width / capture.width * base.width;
+    const sh = photo.height / capture.height * base.height;
     const fitted = Math.min(thumb.width / sw, thumb.height / sh);
     context.fillStyle = "#000";
     context.fillRect(thumb.x, thumb.y, thumb.width, thumb.height);
@@ -411,8 +413,8 @@ function drawRecordingFrame() {
       sw * fitted, sh * fitted);
   }
   if (composition.footer.height > 0 && composition.footer.sourceHeight > 0) {
-    context.drawImage(base, 0, composition.footer.sourceTop / capture.height * base.naturalHeight,
-      base.naturalWidth, composition.footer.sourceHeight / capture.height * base.naturalHeight,
+    context.drawImage(base, 0, composition.footer.sourceTop / capture.height * base.height,
+      base.width, composition.footer.sourceHeight / capture.height * base.height,
       0, composition.footer.y, composition.width, composition.footer.height);
   }
 }

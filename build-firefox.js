@@ -8,6 +8,7 @@ if (destination.toLowerCase() === root.toLowerCase()) {
 }
 
 const files = [
+  "capture-controller.js",
   "png-stitch.js",
   "firefox-background.js",
   "content.js",

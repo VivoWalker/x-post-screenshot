@@ -13,7 +13,7 @@
     "https://twitter.com/*"
   ],
   "background": {
-    "scripts": ["png-stitch.js", "firefox-background.js"]
+    "scripts": ["capture-controller.js", "png-stitch.js", "firefox-background.js"]
   },
   "content_scripts": [
     {
