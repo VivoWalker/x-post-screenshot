@@ -1,4 +1,5 @@
 // Shared background logic. Only the browser-specific controller owns the output.
+const extensionApi = globalThis.browser ?? chrome;
 let activeCapture = null;
 let lastCaptureCallAt = -Infinity;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -19,16 +20,16 @@ function bounded(promise, ms, signal) {
 }
 
 function installCaptureController(run, cleanup) {
-  chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  extensionApi.tabs.onActivated.addListener(({ tabId, windowId }) => {
     if (activeCapture?.windowId === windowId && activeCapture.tabId !== tabId) cancelCapture();
   });
-  chrome.tabs.onRemoved.addListener((id) => { if (activeCapture?.tabId === id) cancelCapture(); });
-  chrome.tabs.onDetached.addListener((id) => { if (activeCapture?.tabId === id) cancelCapture(); });
-  chrome.tabs.onUpdated.addListener((id, change) => {
+  extensionApi.tabs.onRemoved.addListener((id) => { if (activeCapture?.tabId === id) cancelCapture(); });
+  extensionApi.tabs.onDetached.addListener((id) => { if (activeCapture?.tabId === id) cancelCapture(); });
+  extensionApi.tabs.onUpdated.addListener((id, change) => {
     if (activeCapture?.tabId === id && (change.url || change.status === "loading" || change.discarded)) cancelCapture();
   });
-  chrome.windows.onRemoved.addListener((id) => { if (activeCapture?.windowId === id) cancelCapture(); });
-  chrome.windows.onFocusChanged.addListener((id) => {
+  extensionApi.windows.onRemoved.addListener((id) => { if (activeCapture?.windowId === id) cancelCapture(); });
+  extensionApi.windows.onFocusChanged.addListener((id) => {
     if (activeCapture && activeCapture.windowId !== id) cancelCapture();
   });
 
@@ -37,9 +38,9 @@ function installCaptureController(run, cleanup) {
       if (tab?.id != null) notify(tab.id, "error", readableError(error));
     });
   }
-  chrome.action.onClicked.addListener(activate);
-  chrome.commands.onCommand.addListener((command) => { if (command === "start-capture") activate(); });
-  chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  extensionApi.action.onClicked.addListener(activate);
+  extensionApi.commands.onCommand.addListener((command) => { if (command === "start-capture") activate(); });
+  extensionApi.runtime.onMessage.addListener((message, sender, respond) => {
     const job = activeCapture;
     if (message?.type === "X_SHOT_ALIVE") {
       respond({ alive: Boolean(job && job.id === message.jobId && !job.controller.signal.aborted) });
@@ -58,7 +59,7 @@ function installCaptureController(run, cleanup) {
 }
 
 function cancelCapture(reason = "标签页或窗口已变化，截图已取消") {
-  activeCapture?.controller.abort(new Error(reason));
+  if (activeCapture && !activeCapture.downloading) activeCapture.controller.abort(new Error(reason));
 }
 
 async function captureSelection(tab, message, run, cleanup) {
@@ -71,13 +72,13 @@ async function captureSelection(tab, message, run, cleanup) {
       return bounded(fn(), ms, controller.signal);
     },
     page(type, fields = {}, ms) {
-      return this.step(() => chrome.tabs.sendMessage(tab.id, { type, jobId: this.id, ...fields }), ms)
+      return this.step(() => extensionApi.tabs.sendMessage(tab.id, { type, jobId: this.id, ...fields }), ms)
         .then(requireSuccess);
     }
   };
   activeCapture = job;
   try {
-    const origin = await job.step(() => chrome.windows.get(tab.windowId));
+    const origin = await job.step(() => extensionApi.windows.get(tab.windowId));
     if (!origin.focused || origin.state === "minimized") throw new Error("请在当前窗口重新选择帖子");
     await ensureSelectedTab(job);
     await run(job, message.selection);
@@ -85,7 +86,7 @@ async function captureSelection(tab, message, run, cleanup) {
     controller.abort(new Error("截图任务已结束"));
     try {
       await Promise.allSettled([
-        bounded(chrome.tabs.sendMessage(tab.id, { type: "X_SHOT_RESTORE", jobId: job.id }), 3000),
+        bounded(extensionApi.tabs.sendMessage(tab.id, { type: "X_SHOT_RESTORE", jobId: job.id }), 3000),
         cleanup?.(job)
       ]);
     } finally { activeCapture = null; }
@@ -98,7 +99,7 @@ function requireSuccess(result) {
 }
 
 async function ensureSelectedTab(job) {
-  const [tab] = await job.step(() => chrome.tabs.query({ active: true, windowId: job.windowId }));
+  const [tab] = await job.step(() => extensionApi.tabs.query({ active: true, windowId: job.windowId }));
   if (tab?.id !== job.tabId) throw new Error("标签页已切换，截图已取消");
   job.controller.signal.throwIfAborted();
 }
@@ -110,7 +111,7 @@ async function captureVisibleFrame(job) {
     await ensureSelectedTab(job);
     lastCaptureCallAt = Date.now();
     try {
-      const url = await job.step(() => chrome.tabs.captureVisibleTab(job.windowId, { format: "png" }));
+      const url = await job.step(() => extensionApi.tabs.captureVisibleTab(job.windowId, { format: "png" }));
       await ensureSelectedTab(job);
       return url;
     } catch (error) {
@@ -146,27 +147,27 @@ async function captureFrames(job, capture, addFrame) {
 async function enterSelectionMode(tab) {
   const [activeTab] = tab?.id
     ? [tab]
-    : await chrome.tabs.query({ active: true, currentWindow: true });
+    : await extensionApi.tabs.query({ active: true, currentWindow: true });
 
   if (!activeTab?.id || !isSupportedUrl(activeTab.url)) return;
 
   try {
-    await chrome.tabs.sendMessage(activeTab.id, { type: "X_SHOT_ENTER" });
+    await extensionApi.tabs.sendMessage(activeTab.id, { type: "X_SHOT_ENTER" });
   } catch {
-    await chrome.scripting.executeScript({
+    await extensionApi.scripting.executeScript({
       target: { tabId: activeTab.id },
       files: ["content.js"]
     });
-    await chrome.scripting.insertCSS({
+    await extensionApi.scripting.insertCSS({
       target: { tabId: activeTab.id },
       files: ["content.css"]
     });
-    await chrome.tabs.sendMessage(activeTab.id, { type: "X_SHOT_ENTER" });
+    await extensionApi.tabs.sendMessage(activeTab.id, { type: "X_SHOT_ENTER" });
   }
 }
 
 function notify(tabId, kind, text) {
-  return bounded(chrome.tabs.sendMessage(tabId, { type: "X_SHOT_NOTICE", kind, text }), 1500).catch(() => {});
+  return bounded(extensionApi.tabs.sendMessage(tabId, { type: "X_SHOT_NOTICE", kind, text }), 1500).catch(() => {});
 }
 
 function isSupportedUrl(url = "") {

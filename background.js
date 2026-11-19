@@ -35,6 +35,7 @@ installCaptureController(async (job, selection) => {
     if (!recording.dataUrl) throw new Error(recording?.error || "无法完成 MP4 编码");
     await job.page("X_SHOT_RESTORE");
     const filename = `X-Post-Video/x-post-${Date.now()}.mp4`;
+    job.downloading = true;
     const downloadId = await job.step(() => chrome.downloads.download({
       url: recording.dataUrl, filename, saveAs: false, conflictAction: "uniquify"
     }));

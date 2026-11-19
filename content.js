@@ -125,6 +125,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
 (() => {
   if (globalThis.__xShotLoaded) return;
   globalThis.__xShotLoaded = true;
+  const runtime = (globalThis.browser ?? chrome).runtime;
 
   const ARTICLE_SELECTOR = 'article[data-testid="tweet"], article';
   const PRIMARY_SELECTOR = '[data-testid="primaryColumn"]';
@@ -145,7 +146,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     toastTimer: null
   };
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "X_SHOT_ENTER") {
       enterSelection();
       sendResponse({ ok: true });
@@ -239,12 +240,12 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     window.addEventListener("pagehide", cancelPageJob);
     job.heartbeat = setInterval(async () => {
       try {
-        const result = await chrome.runtime.sendMessage({ type: "X_SHOT_ALIVE", jobId: job.id });
+        const result = await runtime.sendMessage({ type: "X_SHOT_ALIVE", jobId: job.id });
         if (!result?.alive) restorePage(job);
       } catch { restorePage(job); }
     }, 5000);
     document.addEventListener("visibilitychange", onVisibilityChange);
-    chrome.runtime.sendMessage({ type: "X_SHOT_SELECTION", jobId: job.id, selection })
+    runtime.sendMessage({ type: "X_SHOT_SELECTION", jobId: job.id, selection })
       .then((result) => {
         if (!result?.ok) showToast(`截图失败：${result?.error || "后台没有返回结果"}`, "error");
       })
@@ -260,7 +261,7 @@ function xShotRestoreVideo({ video, muted, volume, time, paused, loop }) {
     const job = state.job;
     if (!job) return;
     restorePage(job);
-    chrome.runtime.sendMessage({ type: "X_SHOT_CANCEL", jobId: job.id }).catch(() => {});
+    runtime.sendMessage({ type: "X_SHOT_CANCEL", jobId: job.id }).catch(() => {});
   }
 
   function describeSelection(selected) {

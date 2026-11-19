@@ -19,12 +19,8 @@ async function copyPng(job, dataUrl) {
   if (clipboard?.setImageData) {
     const bytes = await job.step(async () => (await fetch(dataUrl)).arrayBuffer());
     await ensureSelectedTab(job);
-    try {
-      await job.step(() => clipboard.setImageData(bytes, "png"));
-      return;
-    } catch {
-      job.controller.signal.throwIfAborted();
-    }
+    const copied = await job.step(() => clipboard.setImageData(bytes, "png").then(() => true, () => false));
+    if (copied) return;
   }
   await ensureSelectedTab(job);
   await job.page("X_SHOT_COPY", { dataUrl });
