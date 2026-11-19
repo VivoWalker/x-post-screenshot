@@ -130,13 +130,14 @@ class BrowserSmoke(unittest.TestCase):
                     const src = document.createElement('canvas'); src.width=width*scale; src.height=height*scale;
                     const ctx=src.getContext('2d');
                     for(let y=0;y<src.height;y++){
-                      ctx.fillStyle='rgb('+(y+scrollY*scale)+',0,0)';ctx.fillRect(0,y,src.width,1);
+                      const row = y+scrollY*scale;
+                      ctx.fillStyle='rgb('+row+','+(row%2 ? 255 : 0)+',0)';ctx.fillRect(0,y,src.width,1);
                     }
                     await stitch.addFrame(src.toDataURL(),{viewportWidth:width,viewportHeight:height,
-                      scrollY,contentTop:scrollY ? 80 : 0,contentBottom:scrollY+height});
+                      scrollY,contentTop:scrollY ? 79.25 : 0,contentBottom:scrollY ? 120 : 79.25});
                   }
                   const {canvas,context}=stitch.job, bytes=context.getImageData(0,0,1,canvas.height).data;
-                  const exact = [...bytes].every((v,i)=> i%4!==0 || v===i/4);
+                  const exact = [...bytes].every((v,i)=> i%4===0 ? v===i/4 : i%4!==1 || v===(Math.floor(i/4)%2 ? 255 : 0));
                   const result=stitch.finish();
                   return [exact,result.width,result.height,canvas.width];
                 }""", scale)

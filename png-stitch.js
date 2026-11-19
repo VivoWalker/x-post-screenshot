@@ -11,7 +11,6 @@ class XShotPngStitcher {
       context: null,
       outputScale: null,
       sourceScale: null,
-      frameCount: 0,
       lastDestinationBottom: 0
     };
     return { ok: true };
@@ -26,8 +25,6 @@ class XShotPngStitcher {
 
     const sourceScaleX = image.naturalWidth / frame.viewportWidth;
     const sourceScaleY = image.naturalHeight / frame.viewportHeight;
-    const cropTop = frame.contentTop - frame.scrollY;
-    const cropHeight = frame.contentBottom - frame.contentTop;
     if (sourceScaleX !== job.sourceScale || sourceScaleY !== job.sourceScaleY) {
       throw new Error("截屏缩放比例变化，请重试");
     }
@@ -37,18 +34,23 @@ class XShotPngStitcher {
       ? job.canvas.height : Math.round((frame.contentBottom - job.capture.top) * job.outputScale);
     const destinationHeight = destinationBottom - destinationTop;
     if (destinationHeight === 0) return { ok: true };
+    // Map the rounded destination back into the source. Stretching an unrounded
+    // source interval over integer rows otherwise blurs alternating pixel rows.
+    const sourceY = (row) => (job.capture.top - frame.scrollY + row / job.outputScale) * sourceScaleY;
+    const sourceTop = Math.max(0, sourceY(destinationTop));
+    const sourceBottom = Math.min(image.naturalHeight, sourceY(destinationBottom),
+      (job.capture.top + job.capture.height - frame.scrollY) * sourceScaleY);
     job.context.drawImage(
       image,
       job.capture.left * sourceScaleX,
-      cropTop * sourceScaleY,
+      sourceTop,
       job.capture.width * sourceScaleX,
-      cropHeight * sourceScaleY,
+      sourceBottom - sourceTop,
       0,
       destinationTop,
       job.canvas.width,
       destinationHeight
     );
-    job.frameCount += 1;
     job.lastDestinationBottom = destinationBottom;
     return { ok: true };
   }
@@ -79,18 +81,18 @@ class XShotPngStitcher {
 
   finish() {
     const job = this.job;
-    if (!job?.canvas) throw new Error("没有可复制的截图内容");
-    const dataUrl = job.canvas.toDataURL("image/png");
-    if (!dataUrl || dataUrl === "data:,") throw new Error("PNG 编码失败");
-    const result = {
-      ok: true,
-      dataUrl,
-      width: job.canvas.width,
-      height: job.canvas.height,
-      scaled: job.outputScale < job.sourceScale - 0.001
-    };
-    this.abort();
-    return result;
+    try {
+      if (!job?.canvas) throw new Error("没有可复制的截图内容");
+      const dataUrl = job.canvas.toDataURL("image/png");
+      if (!dataUrl || dataUrl === "data:,") throw new Error("PNG 编码失败");
+      return {
+        ok: true, dataUrl,
+        width: job.canvas.width, height: job.canvas.height,
+        scaled: job.outputScale < job.sourceScale - 0.001
+      };
+    } finally {
+      this.abort();
+    }
   }
 
   abort() {

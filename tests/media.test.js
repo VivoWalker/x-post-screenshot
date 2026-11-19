@@ -154,3 +154,13 @@ test("changed calibrated stream dimensions signal an immediate error", (t) => {
   assert.equal(ctx.messages.at(-1).type, "X_SHOT_RECORD_ERROR");
   assert.match(ctx.messages.at(-1).error, /尺寸/);
 });
+
+test("PNG encoder failure frees the canvas even before the caller retries", () => {
+  const ctx = context();
+  vm.runInContext(`pngStitcher.begin({});
+    globalThis.canvas = { width: 300, height: 200, toDataURL: () => "data:," };
+    pngStitcher.job.canvas = canvas;`, ctx);
+  assert.throws(() => vm.runInContext("pngStitcher.finish()", ctx), /PNG/);
+  assert.equal(ctx.canvas.width, 0);
+  assert.equal(vm.runInContext("pngStitcher.job", ctx), null);
+});
